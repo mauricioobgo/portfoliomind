@@ -28,6 +28,18 @@ dev = [
     "ruff>=0.8.4",
 ]
 
+# `uv sync` (no extras) installs the default dependency group, so we list
+# dev tooling here too — the card acceptance says `uv run pytest` and
+# `uv run ruff check` must work after a bare `uv sync`. The
+# ``[project.optional-dependencies].dev`` block above is kept for callers
+# on older ``uv`` versions or pip-based installs.
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.8.4",
+]
+
 [project.scripts]
 # CLI scripts live under scripts/ at the project root and are invoked via
 # `uv run python scripts/<name>.py` (per the foundation card spec).

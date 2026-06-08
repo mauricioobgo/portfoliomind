@@ -43,4 +43,22 @@ def screenshot_dir() -> Path:
     return resolve_path("SCREENSHOT_DIR", "./screenshots")
 
 
-__all__ = ["session_dir", "screenshot_dir", "resolve_path"]
+# --- Module-level constants -----------------------------------------------
+# The card-3 spec says:
+#   from portfoliomind.paths import SESSION_DIR, SCREENSHOT_DIR
+# The function-based accessors above are the canonical form (lazy +
+# env-overridable). These module-level constants resolve once at import
+# to the same path the function would return, so callers that want a
+# stable reference (e.g. ``SESSION_DIR / "xtb"``) can use either form.
+
+SESSION_DIR: Path = session_dir()
+SCREENSHOT_DIR: Path = screenshot_dir()
+
+
+__all__ = [
+    "session_dir",
+    "screenshot_dir",
+    "resolve_path",
+    "SESSION_DIR",
+    "SCREENSHOT_DIR",
+]
