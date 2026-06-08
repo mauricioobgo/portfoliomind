@@ -12,12 +12,11 @@ import json
 from typing import Any, cast
 from unittest.mock import MagicMock
 
-import pytest
 
 from portfoliomind.config import PortfoliomindConfig
 from portfoliomind.investingpro.deepdive import deepdive_top_n
 from portfoliomind.sheets.client import SheetsClient
-from portfoliomind.sheets.schema import AGENT_LOG, TAB_HEADERS
+from portfoliomind.sheets.schema import AGENT_LOG
 from portfoliomind.time_utils import iso_now
 
 from .conftest import full_env
