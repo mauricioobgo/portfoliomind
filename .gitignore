@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets and runtime state (CRITICAL — never commit)
+.env
+.env.local
+.env.*.local
+sessions/
+screenshots/
+
+# Service account JSON files (sensitive)
+*service-account*.json
+*gcp-credentials*.json
+**/gcp/*.json
+
+# OS
+Thumbs.db
