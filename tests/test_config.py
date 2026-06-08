@@ -186,3 +186,54 @@ def test_load_env_sources_idempotent(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("X_FROM_PROFILE", "set-in-process")
     load_env_sources(profile_env=profile_env, project_env=project_env)
     assert os.environ.get("X_FROM_PROFILE") == "set-in-process"
+
+
+def test_load_env_sources_honors_hermes_home(tmp_path: Path, monkeypatch):
+    """When $HERMES_HOME is set, the loader looks at $HERMES_HOME/.env first
+    (this is the active profile's .env file). Without HERMES_HOME, falls back
+    to the legacy ~/.hermes/profiles/builder/.env path. The lookup is
+    first-hit-wins, so the active profile always beats the legacy fallback.
+
+    This is the back-compat fix for the portfoliomind profile
+    (HERMES_HOME=/opt/data/profiles/portfoliomind, env at $HERMES_HOME/.env).
+    The foundation card had it hardcoded to ~/.hermes/profiles/builder/.env.
+    """
+    # Case 1: $HERMES_HOME set, active-profile .env exists.
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    active_env = hermes_home / ".env"
+    active_env.write_text("HERMES_HOME_KEY=from-active-profile\n", encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_HOME_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "no-legacy-home"))  # ensure no legacy path
+
+    # Note: do NOT pass profile_env/project_env - the test verifies the
+    # implicit candidate resolution path.
+    loaded = load_env_sources()
+    assert active_env in loaded
+    assert os.environ.get("HERMES_HOME_KEY") == "from-active-profile"
+
+    # Case 2: $HERMES_HOME set, no active .env, legacy path exists.
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    legacy_home = tmp_path / "legacy-home"
+    legacy_env = legacy_home / ".hermes" / "profiles" / "builder" / ".env"
+    legacy_env.parent.mkdir(parents=True, exist_ok=True)
+    legacy_env.write_text("HERMES_HOME_KEY=from-legacy\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(legacy_home))
+    monkeypatch.delenv("HERMES_HOME_KEY", raising=False)
+
+    loaded = load_env_sources()
+    assert legacy_env in loaded
+    assert os.environ.get("HERMES_HOME_KEY") == "from-legacy"
+
+    # Case 3: both active and legacy exist; active wins (first hit).
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(legacy_home))
+    monkeypatch.delenv("HERMES_HOME_KEY", raising=False)
+
+    loaded = load_env_sources()
+    # active_env is loaded; legacy_env is NOT (we break at first hit).
+    assert active_env in loaded
+    assert legacy_env not in loaded
+    assert os.environ.get("HERMES_HOME_KEY") == "from-active-profile"

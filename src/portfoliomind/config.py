@@ -28,7 +28,31 @@ from dotenv import dotenv_values
 
 # Constants — public so tests and CLI scripts can reference them without
 # duplicating string literals.
-HERMES_PROFILE_ENV: Path = Path.home() / ".hermes" / "profiles" / "builder" / ".env"
+#
+# Resolution order for the Hermes profile env (back-compat preserving the
+# foundation card's behavior, but honoring whichever profile is active):
+#   1. ``$HERMES_HOME/.env`` if $HERMES_HOME is set (the active profile)
+#   2. ``~/.hermes/profiles/builder/.env`` (legacy default — the foundation
+#      card's hardcoded path)
+#   3. ``$HERMES_HOME/profiles/builder/.env`` (extra back-compat)
+#
+# The constants below expose the candidates; load_env_sources() picks the
+# first one that exists.
+def _hermes_home_candidates() -> list[Path]:
+    """Return candidate .env paths in precedence order (highest first)."""
+    hh = os.environ.get("HERMES_HOME", "").strip()
+    if hh:
+        hh_path = Path(hh)
+        return [
+            hh_path / ".env",
+            Path.home() / ".hermes" / "profiles" / "builder" / ".env",
+            hh_path / "profiles" / "builder" / ".env",
+        ]
+    # No HERMES_HOME: fall back to ~/.hermes/profiles/builder/.env
+    return [Path.home() / ".hermes" / "profiles" / "builder" / ".env"]
+
+
+HERMES_PROFILE_ENV: Path = _hermes_home_candidates()[0]
 PROJECT_ENV: Path = Path.cwd() / ".env"
 
 REQUIRED_VARS: tuple[str, ...] = (
@@ -51,13 +75,25 @@ class ConfigError(RuntimeError):
     """Raised when one or more required env vars are missing or malformed."""
 
 
-def load_env_sources(*, profile_env: Path = HERMES_PROFILE_ENV, project_env: Path = PROJECT_ENV) -> list[Path]:
+def load_env_sources(
+    *,
+    profile_env: Optional[Path] = None,
+    project_env: Path = PROJECT_ENV,
+) -> list[Path]:
     """Load env files in precedence order (later wins) into ``os.environ``.
 
     Precedence (highest first):
       1. Process env (values already in ``os.environ`` when we run)
       2. Project ``.env`` (if present)
-      3. Hermes profile ``.env`` (if present)
+      3. Hermes profile ``.env`` (first hit wins among the candidates):
+         - ``profile_env`` argument if provided (test override path)
+         - ``$HERMES_HOME/.env`` (the active profile)
+         - ``~/.hermes/profiles/builder/.env`` (legacy default)
+         - ``$HERMES_HOME/profiles/builder/.env`` (extra back-compat)
+
+    The Hermes profile lookup is "first hit wins" — only one Hermes profile
+    env is loaded. This means the active profile's .env always wins over
+    any legacy fallback, even if both exist.
 
     Returns the list of files that were found and applied. Idempotent — safe
     to call once at process start.
@@ -69,9 +105,16 @@ def load_env_sources(*, profile_env: Path = HERMES_PROFILE_ENV, project_env: Pat
     """
     merged: dict[str, str] = {}
     loaded: list[Path] = []
-    if profile_env.is_file():
-        merged.update({k: v for k, v in dotenv_values(profile_env).items() if v is not None})
-        loaded.append(profile_env)
+    # Pick the first existing Hermes profile env (first hit wins).
+    if profile_env is not None:
+        candidates = [profile_env]
+    else:
+        candidates = _hermes_home_candidates()
+    for cand in candidates:
+        if cand.is_file():
+            merged.update({k: v for k, v in dotenv_values(cand).items() if v is not None})
+            loaded.append(cand)
+            break
     if project_env.is_file():
         merged.update({k: v for k, v in dotenv_values(project_env).items() if v is not None})
         loaded.append(project_env)
