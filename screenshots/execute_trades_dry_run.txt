@@ -1,0 +1,15 @@
+
+========================================================================================
+DRY RUN — 3 order(s) ready (no submission will happen)
+========================================================================================
+  #  TICKER      SIDE       QTY       ENTRY          SL          TP    R:R  FLAG
+----------------------------------------------------------------------------------------
+  1  AAPL.US     BUY         10       192.5         189         198   1.57  
+  2  MSFT.US     BUY          5       415.1         405         435   1.97  
+  3  EURUSD      SELL         1       1.095         1.1       1.085   2.00  
+========================================================================================
+
+All orders have SL and TP filled. Re-run with --dry-run=false
+--confirm-each to actually place them on xStation.
+
+Run with --dry-run=false --confirm-each to actually place these orders on xStation.
