@@ -375,6 +375,13 @@ class TestMorningRunLazyConfig:
             "XTB_PASSWORD", "GOOGLE_SERVICE_ACCOUNT_JSON", "OPENAI_API_KEY",
         ):
             monkeypatch.delenv(k, raising=False)
+        # Block config.from_env from re-reading the operator's
+        # profile env (which would re-populate the vars we just
+        # deleted). The test wants to simulate a truly-empty env,
+        # not a "real env masked by monkeypatch".
+        monkeypatch.setattr(
+            "portfoliomind.config.load_env_sources", lambda: []
+        )
         outcome = morning_run()
         assert outcome.status == "failed"
         assert "config load failed" in outcome.errors[0]

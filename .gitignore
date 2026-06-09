@@ -38,6 +38,7 @@ htmlcov/
 .env.*.local
 sessions/
 screenshots/
+.cache/
 
 # Service account JSON files (sensitive)
 *service-account*.json
