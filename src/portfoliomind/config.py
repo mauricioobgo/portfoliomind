@@ -197,6 +197,12 @@ class PortfoliomindConfig:
     # Optional
     session_dir: Path = field(default_factory=lambda: Path("./sessions"))
     screenshot_dir: Path = field(default_factory=lambda: Path("./screenshots"))
+    # XTB trading safety toggles. Both default to safe behavior; flipping
+    # xtb_dry_run to False AND xtb_live_confirm to True is the only path
+    # that allows real orders on xStation. Cards 3 + the morning runner
+    # honor this gate.
+    xtb_dry_run: bool = True
+    xtb_live_confirm: bool = False
 
     KNOWN_VARS: ClassVar[tuple[str, ...]] = ALL_VARS
 

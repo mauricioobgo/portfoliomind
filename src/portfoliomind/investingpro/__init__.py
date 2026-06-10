@@ -10,6 +10,7 @@ Card 2 of the PortfolioMind v4 build. Public contract:
         parse_ai_picks_table,
         parse_deepdive_payload,
     )
+    from portfoliomind.investingpro.runner import run_morning
 
 The Playwright flow is split into:
 
@@ -23,6 +24,13 @@ The Playwright flow is split into:
 
 * :mod:`portfoliomind.investingpro.deepdive` — for the top-N ``RawPick``s,
   opens the ticker deep-dive and captures the Fundamentals block.
+
+* :mod:`portfoliomind.investingpro.runner` — the morning-run integration
+  seam consumed by the card 4 scheduler. Exposes
+  :func:`run_morning(ctx) -> MorningResult` which composes login +
+  scrape + deep-dive and returns a result the scheduler can format
+  into a Discord alert. The runner is the glue; the underlying modules
+  remain the single-purpose, hermetic units they were.
 
 The actual page-to-DataFrame conversion lives in
 :mod:`portfoliomind.investingpro.parse` so it can be unit-tested without a
@@ -40,4 +48,5 @@ __all__ = [
     "DeepDiveFacts",
     "parse_ai_picks_table",
     "parse_deepdive_payload",
+    "run_morning",
 ]

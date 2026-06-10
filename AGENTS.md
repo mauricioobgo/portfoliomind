@@ -32,12 +32,12 @@ The `portfoliomind.scheduler` package (card 4) exposes:
 - `is_morning_trading_day(today=None, *, calendar=HolidayCalendar()) -> bool`
 - `HolidayCalendar.from_env(env=None) -> HolidayCalendar`
 
-## Card 4 / scheduler integration seam
+## Card 2/3/4 runner integration seam
 
 The morning job (`portfoliomind.scheduler.jobs.morning_run`) imports
-the card 2 and card 3 runners **lazily** at run time, so card 4 can
-ship ahead of cards 2/3 without breaking the schedule. Each platform
-runner is expected to expose a callable named `run_morning` at
+the card 2 and card 3 runners **lazily** at run time, so the lazy
+import + the runner module coexist cleanly. Each platform runner
+exposes a callable named `run_morning` at
 `portfoliomind.investingpro.runner` (card 2) and
 `portfoliomind.xtb.runner` (card 3) with this signature:
 
@@ -50,11 +50,50 @@ the current Bogota timestamp, and a `log_to_sheet(level, message)`
 helper. `MorningResult` is a dataclass with `picks_scraped`,
 `orders_placed`, `skipped`, `skip_reason`, and `error` fields.
 
-When the modules are not yet implemented, `morning_run` logs a
-`no_platform_modules` line to AGENT_LOG and exits cleanly with status
-`no_platform_modules` (exit 0 from the CLI). This is the seam — cards
-2/3 just need to register a `run_morning` callable and the morning
-job picks it up.
+When both runner modules are present, the morning job picks them up
+automatically. The "no platform runners registered" line is no
+longer logged on a normal weekday morning; the morning job calls
+both runners, aggregates their `picks_scraped` and `orders_placed`
+counters, and surfaces the first error to the scheduler alert.
+
+### Card 2 runner — `portfoliomind.investingpro.runner`
+
+Composes `login` → `scrape_ai_picks` → `deepdive_top_n` into one
+`run_morning` callable. Idempotent within a Bogota-local day via a
+date-pinned `scraped_at` (`YYYY-MM-DDT08:30:00-05:00`) so two
+morning_run calls in the same day produce the same dedup key. Never
+raises — every failure mode is converted into a `MorningResult` with
+the `error` field set. The runner uses a test injection seam
+(`set_factories` / `reset_factories`) so unit tests can swap in
+in-memory fakes for login / scrape / deep-dive without touching a
+real Playwright browser.
+
+### Card 3 runner — `portfoliomind.xtb.runner`
+
+Reads `APPROVED_TRADES`, and for each row:
+
+* Pre-validates via `OrderSpec.checked` (the SL/TP iron rules). A
+  failure is logged to `EXECUTED_ORDERS` with status
+  `VALIDATION_FAILED` and the batch continues.
+* Dedups against `EXECUTED_ORDERS` — a `(Ticker, Timestamp)` pair
+  already present is skipped.
+* In dry-run mode (the default — `config.xtb_dry_run=True`), the
+  runner does NOT open a browser; it writes a `DRY_RUN` row to
+  `EXECUTED_ORDERS` per trade.
+* In live mode (`xtb_dry_run=False` AND `xtb_live_confirm=True`),
+  the runner opens a persistent Playwright context, logs in to
+  xStation once, calls `place_order` per spec, and writes a
+  `PLACED` (order ID parsed from the confirmation modal) or
+  `UNCONFIRMED` (submit succeeded but we couldn't read the ID)
+  row.
+
+The two-toggle gate (both `xtb_dry_run=False` AND
+`xtb_live_confirm=True`) is the only path that ever moves real
+money; flipping only one keeps the runner in dry-run mode.
+
+If `APPROVED_TRADES` is empty, the runner returns
+`MorningResult(skipped=True, skip_reason="no approved trades")` and
+does not open a browser.
 
 ## Scheduler cron schedule
 
@@ -155,11 +194,12 @@ Card 4 adds one optional env var:
 
 ## Things still in scope for future cards (not done in cards 1-4)
 
-- Card 2: InvestingPro login + scrape (Playwright). Must register a
-  `portfoliomind.investingpro.runner.run_morning` callable.
-- Card 3: XTB xStation login + order placement with mandatory SL
-  (Playwright). Must register a `portfoliomind.xtb.runner.run_morning`
-  callable.
+- Card 2: InvestingPro runner (`portfoliomind.investingpro.runner`) —
+  done. Wires login + scrape + deep-dive into the morning-run seam.
+- Card 3: XTB runner (`portfoliomind.xtb.runner`) — done. Reads
+  `APPROVED_TRADES`, places each order (dry-run by default), writes
+  `EXECUTED_ORDERS`. Honors the two-toggle `xtb_dry_run` /
+  `xtb_live_confirm` gate.
 - Strategy engine, forecast models, signal scoring, KB application.
 - Real trading logic, scoring weights, R/R checks, KB-5
   disqualifications.
