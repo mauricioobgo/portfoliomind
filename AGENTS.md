@@ -134,6 +134,120 @@ signals before posting. The default combine weights (0.6 / 0.4)
 live in three module-level constants so card 7 can re-weight
 without forking the package.
 
+## Card 7 — Position sizer + Discord approval
+
+Card 7 takes a card-6 `Signal` and turns it into a `TradeOrder`
+(qty, entry, SL, TP, notional, commission_rt, r_r_ratio) or a
+`RejectReason`. The flow is split across four small modules so
+each piece is testable in isolation:
+
+* `portfoliomind.signals.sizer` — the `PositionSizer` class.
+  Pure-math; never raises (any failure is converted into a
+  `RejectReason`). Rules: per-trade dollar cap (`xtb_per_trade_cap`,
+  default $200), max open positions (default 5), commission
+  rejection (round-trip > 5% of notional), 2:1 R/R floor. Stocks
+  are whole-share, ETFs can be fractional. Construct via
+  `PositionSizer.from_config(config)` for the standard path.
+* `portfoliomind.signals.commissions` — `XTBCommissionModel`.
+  Hardcoded US schedule: stocks `max($8, 0.08% × notional)`,
+  ETFs 0% under $100k monthly volume, 0.08% above. `round_trip =
+  2 × one_way`. Source URL in the docstring; refresh on schedule
+  changes. `InstrumentType` is a `str`-valued Enum (not a free-form
+  string) so the value round-trips through JSON / Sheets.
+* `portfoliomind.signals.last_close` — small yfinance helper.
+  `last_close(ticker) -> Optional[float]`. Returns `None` on any
+  failure; the sizer converts that into a `RejectReason`. Not
+  cached — the sizer wants the latest close, separate from card 6's
+  day-pinned technical-cache view.
+* `portfoliomind.approval` — the operator-facing approval package.
+  Split into two modules:
+  - `portfoliomind.approval.discord` — `post_candidates_and_collect_reactions(candidates, *, timeout_seconds=1800, ...) -> ApprovalOutcome`. Posts one
+    message to the operator's home thread (configured via
+    `DISCORD_HOME_CHANNEL_THREAD_ID`), adds per-candidate
+    1️⃣-5️⃣ reactions, polls for ✅/❌/⏸ reactions, and treats
+    timeout-as-reject for the per-candidate slots. **Never raises.**
+  - `portfoliomind.approval.persist` — `persist_approved_trades(outcome, sheets, *, sheet_id, dry_run=False) -> PersistResult`. Reads existing
+    `APPROVED_TRADES`, dedups on `(Ticker, signal_date, Entry Price)`,
+    appends the new rows. **Never raises.**
+
+### Public API (card 7)
+
+```python
+from portfoliomind.signals.sizer import PositionSizer, TradeOrder, RejectReason
+from portfoliomind.signals.commissions import XTBCommissionModel, InstrumentType
+from portfoliomind.signals.last_close import last_close
+from portfoliomind.approval import (
+    post_candidates_and_collect_reactions,
+    persist_approved_trades,
+    ApprovalOutcome,
+    ApprovedTrade,
+    RejectedTrade,
+    WaitedTrade,
+    PersistResult,
+)
+```
+
+### Sizing rules (operator-approved 2026-06-08)
+
+* Per-trade dollar cap: $200 per ticker (`xtb_per_trade_cap`).
+* Max open positions: 5 (`xtb_max_open_positions`).
+* Commission rejection: round-trip > 5% of position value
+  (`xtb_max_commission_pct`).
+* Stop-loss: 7% below entry (default; `xtb_sl_pct`).
+* Take-profit: 14% above entry (default; `xtb_tp_pct`).
+* Long-only. Negative `combined` already filtered by card 6.
+
+### Approval flow (Discord interactive)
+
+1. Build one operator-readable message (one line per candidate).
+2. POST to the home thread.
+3. Add 1️⃣-5️⃣ reactions (one per candidate, capped at 5).
+4. Poll the message's reactions for up to 30 min
+   (`APPROVAL_TIMEOUT_MIN`).
+5. ✅ globally → all approved; ❌ globally → all rejected;
+   ⏸ globally → all waited; per-candidate 1️⃣-5️⃣ → that one approved.
+6. Anything not approved by timeout is rejected (logged to
+   `AGENT_LOG`).
+7. Approved subset → `APPROVED_TRADES` via `SheetsClient.append_rows`.
+
+### Dedup key
+
+`persist_approved_trades` keys on the triple
+`(Ticker, signal_date, Entry Price)`. The `signal_date` is
+recovered from the row's Approval Note (`signal_date=YYYY-MM-DD`),
+not the row's wall-clock Timestamp — so a re-run with the same
+data on the same day produces zero new rows.
+
+### Failure isolation
+
+* Discord post fails → outcome has `error` set, but the runner
+  continues. `persist_approved_trades` runs anyway in case partial
+  reactions are present.
+* Sheets read fails → result has `error` set, no rows appended.
+  A "tab not found" is treated as empty (first-ever run).
+* Sheets append fails → result has `error` set, no rows appended.
+* `PositionSizer.size` raises → converted to `RejectReason`. The
+  runner (card 8) logs and continues with the next candidate.
+* `last_close` returns `None` (yfinance down) → sizer rejects
+  with "entry price unavailable".
+
+### Iron rules (sizer + approval)
+
+1. **Stop-loss is mandatory.** The sizer always sets `sl =
+   entry * (1 - xtb_sl_pct)`. A misconfigured `xtb_sl_pct` (≤ 0 or
+   ≥ 1) raises at construction time, never silently produces a
+   zero-stop order.
+2. **Long-only.** The sizer does not check direction (card 6
+   already filters `combined > 0`). It will *not* size a short
+   sell even if called with a negative `combined` — the resulting
+   qty and SL/TP math would be wrong, and the upstream filter
+   is the contract.
+3. **Never raise.** Every public function in the card 7 surface
+   (`size`, `post_candidates_and_collect_reactions`,
+   `persist_approved_trades`, `last_close`) catches all
+   exceptions and returns a result/error object. The strategy
+   runner (card 8) depends on this.
+
 ## Card 2 runner — `portfoliomind.investingpro.runner`
 
 Composes `login` → `scrape_ai_picks` → `deepdive_top_n` into one
@@ -395,10 +509,19 @@ Card 4 adds one optional env var:
   sentiment → single `Signal(ticker, combined, technical, sentiment,
   confidence, reasons)` in [-1, +1]. Card 7 (Discord approval) and
   card 8 (morning-run wiring) consume this.
-- Card 7: Position sizer + Discord interactive approval — in
-  progress. Will produce the `PositionSizer` and
-  `post_candidates_and_collect_reactions` functions the strategy
-  runner lazy-imports.
+- Card 7: Position sizer + Discord interactive approval
+  (`portfoliomind.signals.sizer`, `portfoliomind.signals.commissions`,
+  `portfoliomind.signals.last_close`, `portfoliomind.approval.*`) —
+  done. Sizer converts card-6 Signals into TradeOrders (qty, entry,
+  SL, TP, notional, commission_rt, r_r_ratio) honoring the
+  per-trade cap, max open positions, commission rejection (>$5% of
+  notional), and 2:1 R/R floor. Discord approval posts the batch
+  to the operator's home thread, collects ✅/❌/⏸ reactions (and
+  per-candidate 1️⃣-5️⃣ taps), and writes the approved subset to
+  `APPROVED_TRADES` with `(ticker, signal_date, entry_price)` dedup.
+  XTB commission model is hardcoded in `signals.commissions` with
+  the source URL in the docstring; refresh the constants on schedule
+  changes.
 - Card 8 (this card): Strategy runner wiring — done. The
   runner is the integration seam that will activate automatically
   once card 7 lands.

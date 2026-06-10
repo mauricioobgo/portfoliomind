@@ -158,7 +158,19 @@ def test_known_vars_constant():
         "GOOGLE_SHEET_ID",
         "OPENAI_API_KEY",
     }
-    assert set(OPTIONAL_VARS) == {"SESSION_DIR", "SCREENSHOT_DIR"}
+    # Card 7 added sizing + approval env knobs.
+    assert set(OPTIONAL_VARS) == {
+        "SESSION_DIR",
+        "SCREENSHOT_DIR",
+        "XTB_PER_TRADE_CAP",
+        "XTB_MAX_OPEN_POSITIONS",
+        "XTB_SL_PCT",
+        "XTB_TP_PCT",
+        "XTB_MAX_COMMISSION_PCT",
+        "APPROVAL_TIMEOUT_MIN",
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_HOME_CHANNEL_THREAD_ID",
+    }
     assert set(ALL_VARS) == set(REQUIRED_VARS) | set(OPTIONAL_VARS)
 
 
