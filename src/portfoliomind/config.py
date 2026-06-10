@@ -203,6 +203,14 @@ class PortfoliomindConfig:
     # honor this gate.
     xtb_dry_run: bool = True
     xtb_live_confirm: bool = False
+    # Card 6 — directory for the signals cache file. The technical
+    # scores share a single SQLite file with the news cache
+    # (``news_cache.sqlite`` lives here by default), so the directory
+    # is what matters; the filename is hard-coded in
+    # :mod:`portfoliomind.news.store`. Override via the
+    # ``SIGNALS_CACHE_PATH`` env var (full path) — that takes
+    # precedence over this directory default.
+    signals_cache_dir: Path = field(default_factory=lambda: Path("./.cache"))
 
     KNOWN_VARS: ClassVar[tuple[str, ...]] = ALL_VARS
 
