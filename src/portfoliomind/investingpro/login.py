@@ -27,6 +27,7 @@ Design choices, restated for reviewers:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -224,10 +225,19 @@ def login(
                 except Exception:
                     pass
                 raise
-    except (InvestingProLoginError, PlaywrightTimeoutError) as e:
+    except InvestingProLoginError:
+        # Already an InvestingProLoginError — log the screenshot path
+        # (the inner handler wrote one) and re-raise. Wrapping it again
+        # would produce the "InvestingPro login failed:
+        # InvestingProLoginError: InvestingPro login failed: ..."
+        # double-wrap that confused the operator in the 2026-06-10
+        # smoke test.
+        log.error("investingpro.login.failed (see prior screenshot log line)")
+        raise
+    except PlaywrightTimeoutError as e:
         log.error("investingpro.login.failed: %s", type(e).__name__)
         raise InvestingProLoginError(
-            f"InvestingPro login failed: {type(e).__name__}"
+            "InvestingPro login failed: Playwright timeout"
         ) from e
     except Exception as e:  # last-ditch safety net
         log.error("investingpro.login.unexpected: %s", type(e).__name__)
@@ -277,6 +287,19 @@ def _fill_login_form(page: Page, config: PortfoliomindConfig) -> None:
     password_el.fill(config.investingpro_password)
 
 
+# Maximum number of submit-click attempts. The first attempt may race the
+# page's click-handler binding; subsequent attempts give the JS a chance
+# to settle. Kept small (3) because a sustained disabled state means the
+# page is genuinely broken (2FA / captcha / layout change) and we want
+# the operator to see the screenshot, not loop forever.
+_SUBMIT_CLICK_MAX_ATTEMPTS = 3
+# Backoff between submit-click retries, in milliseconds. 500ms is
+# long enough to bridge the typical "fetch extra resources" window
+# that InvestingPro's anti-bot challenge opens, short enough to stay
+# inside the 30s login budget.
+_SUBMIT_CLICK_RETRY_BACKOFF_MS = 500
+
+
 def _submit_and_wait(page: Page, *, expected_url_substring: str) -> str:
     """Click submit, wait for the URL to change off the login page.
 
@@ -284,16 +307,65 @@ def _submit_and_wait(page: Page, *, expected_url_substring: str) -> str:
     directly, sometimes to a portal page that requires another click.
     We accept any URL that contains the expected substring or that no
     longer looks like the login form.
+
+    InvestingPro's login page is a JS-heavy SPA that may render the
+    submit button before its click handler is bound. We therefore
+    (1) wait for the button to be in the ``enabled`` state and
+    (2) retry the click a few times if Playwright still reports the
+    button as disabled on the first attempt (the click-handler-binding
+    race window observed in the 2026-06-10 live smoke test).
     """
     submit = _wait_for_first(page, _SUBMIT_SELECTORS, _LOGIN_TIMEOUT_S * 1000)
     if submit is None:
         raise InvestingProLoginError(
             "Could not find the submit button on the InvestingPro login page"
         )
-    # Some InvestingPro forms are dispatched on Enter inside the password
-    # field; we click explicitly. If the click is intercepted, the click
-    # raises and the outer try / except will screenshot + raise.
-    submit.click()
+
+    # Wait for the button to be enabled. InvestingPro's client-side JS
+    # enables the submit button only after CSRF / anti-bot challenge
+    # data resolves. Use a bounded wait so a stuck button (2FA, captcha,
+    # layout change) eventually times out and the operator sees the
+    # screenshot — not a silent hang. We use ``is_enabled()`` polled
+    # ourselves because Playwright's :meth:`Locator.wait_for` has no
+    # ``state="enabled"`` mode — click() also auto-waits, but raises a
+    # plain ``TimeoutError`` with no per-state detail, so a separate
+    # guard gives us a clearer error message.
+    if not _wait_for_enabled(submit, _LOGIN_TIMEOUT_S * 1000):
+        raise InvestingProLoginError(
+            "Submit button stayed disabled past the login timeout — "
+            "the page likely hit a 2FA / captcha / anti-bot challenge "
+            "or the layout changed; see the failure screenshot."
+        )
+
+    # Click with a small retry loop. The race window we observed is
+    # ~few-hundred-ms: the button reports enabled (its ``disabled``
+    # attribute is cleared) but the JS click handler is still being
+    # bound. A second or third attempt lands once the handler is live.
+    last_error: Exception | None = None
+    for attempt in range(1, _SUBMIT_CLICK_MAX_ATTEMPTS + 1):
+        try:
+            submit.click(timeout=_LOGIN_TIMEOUT_S * 1000)
+            last_error = None
+            break
+        except PlaywrightTimeoutError as e:
+            last_error = e
+            if attempt < _SUBMIT_CLICK_MAX_ATTEMPTS:
+                log.debug(
+                    "investingpro.login.submit.retry attempt=%d/%d err=%s",
+                    attempt,
+                    _SUBMIT_CLICK_MAX_ATTEMPTS,
+                    type(e).__name__,
+                )
+                page.wait_for_timeout(_SUBMIT_CLICK_RETRY_BACKOFF_MS)
+                # Re-wait for enabled in case the button got re-disabled.
+                _wait_for_enabled(submit, _SUBMIT_CLICK_RETRY_BACKOFF_MS)
+    if last_error is not None:
+        raise InvestingProLoginError(
+            "Submit button could not be clicked after "
+            f"{_SUBMIT_CLICK_MAX_ATTEMPTS} attempts; the page likely "
+            "changed or a challenge is blocking the click — see the "
+            "failure screenshot."
+        ) from last_error
 
     # Wait for the URL to leave /login. Use a generous timeout — the
     # server may take a few seconds to redirect on a cold session.
@@ -311,6 +383,35 @@ def _submit_and_wait(page: Page, *, expected_url_substring: str) -> str:
         ) from e
 
     return page.url
+
+
+def _wait_for_enabled(element, timeout_ms: int) -> bool:
+    """Poll ``element.is_enabled()`` until it returns ``True`` or the
+    timeout elapses. Returns the final ``is_enabled()`` value.
+
+    InvestingPro's login button is rendered disabled while the page
+    fetches CSRF / anti-bot challenge data. Playwright's
+    :meth:`Locator.wait_for` has no ``state="enabled"`` mode, so we
+    poll :meth:`is_enabled` directly. The poll interval is 100ms —
+    coarse enough to be cheap, fine enough to feel instant in tests.
+    """
+    interval_s = 0.1
+    deadline_s = timeout_ms / 1000
+    elapsed = 0.0
+    while elapsed < deadline_s:
+        try:
+            if element.is_enabled():
+                return True
+        except Exception:
+            # The element handle may be detached mid-wait. Treat as
+            # "not enabled yet" and keep polling until the deadline.
+            pass
+        time.sleep(interval_s)
+        elapsed += interval_s
+    try:
+        return element.is_enabled()
+    except Exception:
+        return False
 
 
 def _wait_for_first(page: Page, selectors: tuple[str, ...], timeout_ms: int):
