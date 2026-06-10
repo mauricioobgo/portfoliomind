@@ -205,6 +205,70 @@ Card 4 adds one optional env var:
   disqualifications.
 - Paper-to-live account migration.
 
+## Card 6 — Technical + combined signal (portfoliomind.signals)
+
+The signal module computes 4 technical indicators per ticker (via
+yfinance + the `ta`-equivalent pure-Python math) and combines them
+with the card 5 news sentiment.
+
+Public surface (importable as the contract for card 7):
+
+```python
+from portfoliomind.signals import (
+    Candidate,                 # the public dataclass for card 7
+    TechnicalSignal,           # the 4 booleans + underlying numbers
+    compute_technical_signal,  # ticker → TechnicalSignal (with yfinance + cache)
+    score_universe,            # tickers → top-N Candidate (AND-of-two gate)
+    PriceCache,                # the SQLite price cache
+    MIN_TECHNICAL_BULLISH,     # 2
+    MIN_NEWS_SENTIMENT,        # +0.2
+    WEIGHT_TECHNICAL,          # 0.6
+    WEIGHT_NEWS,               # 0.4
+    STRATEGY,                  # "swing-bullish-news"
+    TIMEFRAME,                 # "swing"
+)
+```
+
+The `Candidate` dataclass is the contract for card 7 (sizer +
+Discord approval): `ticker, strategy, timeframe, entry_price,
+technical_score (0-1), news_score (-1, +1), combined_score,
+top_signal_reason, technical_signal`.
+
+The four indicators:
+
+* **50/200 SMA golden cross** — SMA(50) > SMA(200). Long-term trend.
+* **20-day high breakout** — today's close > max of the prior 20
+  closes. Price action.
+* **MACD bullish crossover (12/26/9)** — MACD line > signal line.
+* **RSI(14) not overbought** — RSI < 70. A precondition, not a
+  signal in itself.
+
+The AND-of-two gate: a ticker is a candidate iff
+`bullish_count >= 2` AND `news_score > +0.2`. The combined score
+weights are `0.6 * (bullish_count/4) + 0.4 * news_score`.
+
+Key invariants:
+
+* yfinance is cached for 1 hour (`PRICE_TTL_SECONDS`) — the morning
+  run does not re-pull within the session.
+* The price cache is keyed by `(ticker, as_of_date)` so a backtest
+  re-run with a different date re-computes (no look-ahead bias).
+* yfinance returns the CURRENT (partial) bar with NaN close; the
+  signal drops it and uses the last fully-closed bar. This is the
+  "yesterday's close" semantics the spec calls for.
+* A yfinance failure for ONE ticker logs WARNING and skips — it
+  never breaks the whole universe. The combined gate drops the
+  empty-signal sentinel (bullish_count=0, close=0.0) automatically.
+* An LLM sentiment failure falls back to 0.0 for every ticker,
+  which means the news gate drops everyone. The morning run still
+  completes cleanly.
+* The Candidate dataclass is `frozen=True` so an operator
+  reviewing the list cannot accidentally mutate it.
+
+The demo (`scripts/demo_signals.py`) prints the top-N candidates
+with their score components. Run it with `--as-of-date YYYY-MM-DD`
+to backtest a specific trading day.
+
 ## Failure alerting (card 4)
 
 The morning and returns jobs both log a one-line `summary_line()` to
