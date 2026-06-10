@@ -15,15 +15,19 @@ What we cache:
 * **Sentiment scores** keyed by (ticker, day) with a JSON blob of
   per-headline scores + the aggregate. The sentiment scorer reads
   this to return the same answer for the same day.
+* **Technical scores** keyed by (ticker, asof_date) with the raw
+  indicators + per-component sub-scores. Card 6 added this table to
+  the same DB so a single backup captures both news and signals.
 
 What we do NOT cache:
 * The per-run in-process memoization in :mod:`portfoliomind.news.feeds`
   is separate from this — it's the only thing that lets the per-ticker
   scoring path avoid hitting the network N times.
 
-Cache schema version: bump ``HEADLINE_CACHE_SCHEMA_VERSION`` if you
-change the table layout. The store will refuse to open older DBs and
-let the caller decide what to do.
+Cache schema version: bump ``NEWS_CACHE_SCHEMA_VERSION`` when you add
+a new table. The store runs a forward-only migration (e.g. ``v1 → v2``)
+so older caches are upgraded in place rather than refused. A newer
+version than the code can handle is rejected.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from ..logging_setup import get_logger
 from ..time_utils import iso_now
@@ -43,7 +47,10 @@ from ._headline import Headline
 log = get_logger(__name__)
 
 #: Bump this when changing the table layout so older caches are detected.
-HEADLINE_CACHE_SCHEMA_VERSION: int = 1
+#: v1 = headlines + sentiment (card 5). v2 = + technical_cache (card 6).
+NEWS_CACHE_SCHEMA_VERSION: int = 2
+#: Back-compat alias. Card 5 callers imported this name.
+HEADLINE_CACHE_SCHEMA_VERSION: int = NEWS_CACHE_SCHEMA_VERSION
 
 # Default location: <project>/.cache/news_cache.sqlite, override via
 # the constructor ``db_path`` arg.
@@ -94,15 +101,18 @@ class NewsCache:
             if row is None:
                 c.execute(
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-                    (str(HEADLINE_CACHE_SCHEMA_VERSION),),
+                    (str(NEWS_CACHE_SCHEMA_VERSION),),
                 )
             else:
                 existing = int(row["value"])
-                if existing != HEADLINE_CACHE_SCHEMA_VERSION:
+                if existing > NEWS_CACHE_SCHEMA_VERSION:
                     raise NewsCacheError(
-                        f"cache schema version mismatch: file={existing} code="
-                        f"{HEADLINE_CACHE_SCHEMA_VERSION}. Delete the cache or migrate."
+                        f"cache schema version newer than code: file={existing} code="
+                        f"{NEWS_CACHE_SCHEMA_VERSION}. Refusing to open; check out an "
+                        "older revision or wipe the cache."
                     )
+                if existing < NEWS_CACHE_SCHEMA_VERSION:
+                    self._migrate(c, existing)
 
             c.execute(
                 """
@@ -135,6 +145,44 @@ class NewsCache:
                 )
                 """
             )
+
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS technical_cache (
+                    ticker TEXT NOT NULL,
+                    asof_date TEXT NOT NULL,
+                    trend REAL NOT NULL,
+                    momentum REAL NOT NULL,
+                    volatility REAL NOT NULL,
+                    score REAL NOT NULL,
+                    sma_fast REAL,
+                    sma_slow REAL,
+                    rsi REAL,
+                    short_vol REAL,
+                    long_vol REAL,
+                    reasons_json TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (ticker, asof_date)
+                )
+                """
+            )
+
+    def _migrate(self, c: sqlite3.Connection, existing: int) -> None:
+        """Run forward-only schema migrations in order.
+
+        Card 6: v1 → v2 adds the ``technical_cache`` table. The news
+        tables are unchanged; we just stamp the new version. Later
+        cards should add ``if existing < N:`` blocks here.
+        """
+        if existing < 2:
+            # v1 had headlines + sentiment_scores. v2 adds technical_cache.
+            # The table is created by _init_schema() after this returns;
+            # we only need to bump the version row.
+            c.execute(
+                "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                ("2",),
+            )
+            log.info("news_cache: migrated v1 → v2 (added technical_cache)")
 
     # --- Headline storage -----------------------------------------------
 
@@ -314,11 +362,114 @@ class NewsCache:
         with self._lock, self._conn() as c:
             h_count = c.execute("SELECT COUNT(*) AS n FROM headlines").fetchone()["n"]
             s_count = c.execute("SELECT COUNT(*) AS n FROM sentiment_scores").fetchone()["n"]
+            t_count = c.execute("SELECT COUNT(*) AS n FROM technical_cache").fetchone()["n"]
         return {
             "db_path": str(self._db_path),
-            "schema_version": HEADLINE_CACHE_SCHEMA_VERSION,
+            "schema_version": NEWS_CACHE_SCHEMA_VERSION,
             "headline_rows": h_count,
             "sentiment_rows": s_count,
+            "technical_rows": t_count,
+        }
+
+    # --- Technical cache (card 6) --------------------------------------
+
+    def store_technical(self, score: Any, *, asof_date: str) -> None:
+        """Persist a :class:`TechnicalScore` for ``(score.ticker, asof_date)``.
+
+        Idempotent: a second call for the same key overwrites the row.
+        ``score`` is duck-typed (any object with the TechnicalScore
+        fields) to avoid an import cycle between signals.cache and
+        signals.technicals.
+        """
+        with self._lock, self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO technical_cache
+                    (ticker, asof_date, trend, momentum, volatility, score,
+                     sma_fast, sma_slow, rsi, short_vol, long_vol,
+                     reasons_json, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    score.ticker.upper(),
+                    asof_date,
+                    float(score.trend),
+                    float(score.momentum),
+                    float(score.volatility),
+                    float(score.score),
+                    self._extract_indicator(score, "sma_fast"),
+                    self._extract_indicator(score, "sma_slow"),
+                    self._extract_indicator(score, "rsi"),
+                    self._extract_indicator(score, "short_vol"),
+                    self._extract_indicator(score, "long_vol"),
+                    json.dumps(list(score.reasons)),
+                    iso_now(),
+                ),
+            )
+
+    @staticmethod
+    def _extract_indicator(score: Any, name: str) -> Optional[float]:
+        """Pull a named indicator from a TechnicalScore if present.
+
+        Older callers may build the score without the raw indicators
+        populated (e.g. tests) — we tolerate that and store NULL.
+        """
+        val = getattr(score, name, None)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    def fetch_technical(self, *, ticker: str, asof_date: str) -> Optional[dict]:
+        """Return the cached technical row for ``(ticker, asof_date)`` or None.
+
+        Shape::
+
+            {
+                "ticker": str,
+                "asof_date": str,
+                "trend": float,
+                "momentum": float,
+                "volatility": float,
+                "score": float,
+                "sma_fast": float | None,
+                "sma_slow": float | None,
+                "rsi": float | None,
+                "short_vol": float | None,
+                "long_vol": float | None,
+                "reasons": list[str],
+                "fetched_at": str,
+            }
+        """
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                """
+                SELECT ticker, asof_date, trend, momentum, volatility, score,
+                       sma_fast, sma_slow, rsi, short_vol, long_vol,
+                       reasons_json, fetched_at
+                FROM technical_cache
+                WHERE ticker = ? AND asof_date = ?
+                """,
+                (ticker.upper(), asof_date),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ticker": row["ticker"],
+            "asof_date": row["asof_date"],
+            "trend": row["trend"],
+            "momentum": row["momentum"],
+            "volatility": row["volatility"],
+            "score": row["score"],
+            "sma_fast": row["sma_fast"],
+            "sma_slow": row["sma_slow"],
+            "rsi": row["rsi"],
+            "short_vol": row["short_vol"],
+            "long_vol": row["long_vol"],
+            "reasons": json.loads(row["reasons_json"]),
+            "fetched_at": row["fetched_at"],
         }
 
 
@@ -329,6 +480,7 @@ class NewsCacheError(RuntimeError):
 __all__ = [
     "NewsCache",
     "NewsCacheError",
-    "HEADLINE_CACHE_SCHEMA_VERSION",
+    "NEWS_CACHE_SCHEMA_VERSION",
+    "HEADLINE_CACHE_SCHEMA_VERSION",  # back-compat alias
     "DEFAULT_CACHE_PATH",
 ]

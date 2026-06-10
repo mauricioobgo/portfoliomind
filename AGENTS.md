@@ -56,7 +56,85 @@ longer logged on a normal weekday morning; the morning job calls
 both runners, aggregates their `picks_scraped` and `orders_placed`
 counters, and surfaces the first error to the scheduler alert.
 
-### Card 2 runner — `portfoliomind.investingpro.runner`
+## Card 5/6 runner — `portfoliomind.signals`
+
+Card 6 builds a single combined signal per ticker: technical
+indicators (trend + momentum + volatility) + news sentiment (card
+5's `score_ticker_sentiment`). The package is split across three
+modules so each piece is testable in isolation:
+
+* `portfoliomind.signals.technicals` — pure-math SMA ratio, RSI(14),
+  realized-vol regime → `TechnicalScore` in [-1, +1]. The yfinance
+  fetch lives here too (`fetch_ohlcv`) and is the only network call
+  in the package. All OHLCV logs are DEBUG-only (no raw OHLCV at
+  INFO per the card 6 spec).
+* `portfoliomind.signals.cache` — same-day idempotency layer
+  wrapping `NewsCache`. Reads/writes the `technical_cache` table
+  (added by the v1 → v2 migration in
+  :mod:`portfoliomind.news.store`). The cache shares the same
+  SQLite file as the news cache, so a single backup captures both
+  tables.
+* `portfoliomind.signals.combiner` — the public entry point
+  consumed by card 7/8: `score_ticker(ticker) -> Signal` and
+  `score_universe() -> list[Signal]`. **Never raises** — every
+  failure mode is converted into a `Signal` with `combined=0.0` and
+  the error string in `reasons`. Card 7/8 depend on this contract.
+
+### Public API (card 6)
+
+```python
+from portfoliomind.signals import (
+    Signal,                       # the combined output dataclass
+    TechnicalScore,               # the technical-only dataclass
+    score_ticker,                 # single-ticker entry, never raises
+    score_universe,               # full UNIVERSE, sorted by combined desc
+    compute_technical_score,      # pure-math, takes closes list
+    TechnicalCache,               # same-day idempotency layer
+)
+```
+
+### Combine math
+
+* `combined = 0.6 * technical.score + 0.4 * sentiment` (weights
+  in `portfoliomind.signals.combiner.WEIGHT_TECHNICAL` /
+  `WEIGHT_SENTIMENT`).
+* `confidence = |combined| * (1 - |technical - sentiment|)` — high
+  when components agree AND the combined signal is large. A signal
+  where the components contradict has near-zero confidence and
+  should be filtered out before any operator-facing ping.
+* `TechnicalScore.score = 0.5*trend + 0.3*momentum + 0.2*volatility`
+  (weights in `portfoliomind.signals.technicals.WEIGHT_TREND` /
+  `WEIGHT_MOMENTUM` / `WEIGHT_VOLATILITY`).
+
+### Idempotency contract
+
+A re-run of `score_universe()` in the same Bogota day returns
+**identical** `Signal` objects for every ticker — the technical
+cache is keyed on `(ticker, asof_date)` and the sentiment cache is
+keyed on `(ticker, day)`; both are day-pinned in Bogota time. A run
+after midnight Bogota triggers a fresh yfinance fetch + (if not
+cached) a fresh LLM sentiment call.
+
+### Cache schema migration (v1 → v2)
+
+The `technical_cache` table was added in card 6. The
+`portfoliomind.news.store.NewsCache` runs a forward-only migration
+on open: if it sees a v1 DB, it stamps the version row to v2 and
+the new table is created on the same connection. A v2+ DB that the
+current code can't read is rejected with a clear `NewsCacheError`.
+
+### Handoff to card 7
+
+Card 7 (Discord approval) will import `score_universe`, pick the
+top-N bullish + bottom-N bearish signals, and post them to the
+operator's Discord home channel with approve/reject buttons. The
+`confidence` field is what determines whether a signal warrants a
+Discord ping — card 7 should filter out `confidence < some_threshold`
+signals before posting. The default combine weights (0.6 / 0.4)
+live in three module-level constants so card 7 can re-weight
+without forking the package.
+
+## Card 2 runner — `portfoliomind.investingpro.runner`
 
 Composes `login` → `scrape_ai_picks` → `deepdive_top_n` into one
 `run_morning` callable. Idempotent within a Bogota-local day via a
@@ -200,7 +278,15 @@ Card 4 adds one optional env var:
   `APPROVED_TRADES`, places each order (dry-run by default), writes
   `EXECUTED_ORDERS`. Honors the two-toggle `xtb_dry_run` /
   `xtb_live_confirm` gate.
-- Strategy engine, forecast models, signal scoring, KB application.
+- Card 5: News + LLM sentiment scoring (`portfoliomind.news.*`) —
+  done. RSS ingestion + 4o-mini scoring. Output: `score_ticker_sentiment`
+  in [-1, +1] per ticker per Bogota day, cached for same-day
+  idempotency.
+- Card 6: Combined strategy signal (`portfoliomind.signals.*`) —
+  done. Technical indicators (SMA ratio, RSI, vol regime) + news
+  sentiment → single `Signal(ticker, combined, technical, sentiment,
+  confidence, reasons)` in [-1, +1]. Card 7 (Discord approval) and
+  card 8 (morning-run wiring) consume this.
 - Real trading logic, scoring weights, R/R checks, KB-5
   disqualifications.
 - Paper-to-live account migration.
