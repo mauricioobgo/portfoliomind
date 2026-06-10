@@ -456,6 +456,26 @@ class TestMorningRunNoPlatformModules:
             "portfoliomind.scheduler.jobs._try_import_card3",
             lambda: fake_xtb,
         )
+        # Card 7 is live in this build, so the strategy runner is
+        # importable. The test only cares about card-2/3 aggregation,
+        # so stub the strategy runner too (it would otherwise try to
+        # hit yfinance and Discord).
+        from portfoliomind.strategy_runner import StrategyResult
+
+        def fake_strat(ctx: MorningContext) -> StrategyResult:
+            return StrategyResult(
+                runner="strategy",
+                status="ran",
+                picks_scraped=0,
+                orders_placed=0,
+                approved_count=0,
+                rejected_count=0,
+            )
+
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_strategy",
+            lambda: fake_strat,
+        )
 
         today = datetime(2026, 6, 8, 8, 30, tzinfo=JOBS_BOGOTA_TZ)
         outcome = morning_run(config=cfg, sheets=fake_sheets, today=today)

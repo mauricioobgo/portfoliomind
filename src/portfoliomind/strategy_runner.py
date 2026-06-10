@@ -12,9 +12,11 @@ tick.
 The pipeline is composed of three card-6/7 modules that this card
 treats as a public contract:
 
-* :mod:`portfoliomind.signals.combined` — :func:`score_universe` returns
-  the top-N candidates that pass both the bullish-tech gate AND the
-  positive-news gate.
+* :mod:`portfoliomind.signals` — :func:`score_universe` (re-exported
+  from :mod:`portfoliomind.signals.combiner`) returns the top-N
+  candidates that pass both the bullish-tech gate AND the
+  positive-news gate. We import from the package surface so we don't
+  depend on the internal module name.
 * :mod:`portfoliomind.signals.sizer` — :class:`PositionSizer` sizes
   each candidate into a ``TradeOrder`` (qty, entry, SL, TP) honoring
   the commission-aware cap and the max-positions rule.
@@ -50,7 +52,7 @@ dedup-keyed on ``(Ticker, Timestamp)``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, cast
 
 from .logging_setup import get_logger
 from .time_utils import iso_now
@@ -131,9 +133,16 @@ class StrategyResult:
 
 
 class _SignalsModule(Protocol):
-    """The structural type we expect from ``portfoliomind.signals``."""
+    """The structural type we expect from ``portfoliomind.signals``.
 
-    def score_universe(self, *, top_n: int = 5) -> list[Any]: ...
+    Card 6 ships ``score_universe()`` returning the full UNIVERSE
+    sorted by ``combined`` desc; the strategy runner (card 8) is
+    responsible for slicing to the top-N. The ``top_n`` keyword
+    here is a runner-side cap, NOT a contract on the signals
+    module.
+    """
+
+    def score_universe(self, **kwargs: Any) -> list[Any]: ...
 
 
 class _SizerClass(Protocol):
@@ -159,11 +168,16 @@ class _ApprovalModule(Protocol):
 
 
 def _try_import_signals() -> Optional[_SignalsModule]:
-    """Lazy import of ``portfoliomind.signals.combined`` (card 6).
+    """Lazy import of ``portfoliomind.signals`` (card 6).
 
-    Returns the module object, or ``None`` if card 6 has not landed.
-    Card 8 ships ahead of card 6; the morning job must keep ticking
-    even when the strategy is not implemented.
+    Returns a module-like object exposing ``score_universe(top_n=...)``,
+    or ``None`` if card 6 has not landed. Card 8 ships ahead of
+    card 6; the morning job must keep ticking even when the
+    strategy is not implemented.
+
+    We import from the package surface (``portfoliomind.signals``)
+    rather than the internal ``combiner`` module so the runner
+    doesn't break if card 6 reorganizes its internal layout.
 
     When a test factory is installed via :func:`set_factories`, this
     function returns the test factory instead of the lazy-imported
@@ -173,12 +187,16 @@ def _try_import_signals() -> Optional[_SignalsModule]:
     if _score_universe_factory is not None:
         return _score_universe_factory
     try:
-        from .signals import combined as signals_combined  # type: ignore[import-not-found]
+        from . import signals as signals_pkg  # type: ignore[import-not-found]
     except ImportError:
         return None
-    if not hasattr(signals_combined, "score_universe"):
+    if not hasattr(signals_pkg, "score_universe"):
         return None
-    return signals_combined
+    # Card 6's score_universe() returns the full UNIVERSE sorted by
+    # combined desc; the runner slices to top_n. The protocol declares
+    # top_n as a kwarg, but we tolerate the actual card-6 signature
+    # (which has no top_n) via cast().
+    return cast(_SignalsModule, signals_pkg)
 
 
 def _try_import_sizer() -> Optional[type[_SizerClass]]:
@@ -221,16 +239,35 @@ def _score_candidates(
     A missing signals module is treated as a "not implemented" signal,
     not a failure — the caller will convert that into
     ``status='not_implemented'``.
+
+    The card-6 ``score_universe()`` returns the full universe sorted
+    by ``combined`` desc with no top_n cap. We call it with no
+    arguments and slice to the top ``top_n`` here. Slicing at the
+    runner layer keeps card 6 a pure "score everything" function
+    and the runner the single place that decides how many to act on.
     """
     if signals is None:
-        return [], "card 6 signals.combined.score_universe not implemented"
+        return [], "card 6 signals.score_universe not implemented"
     try:
-        candidates = signals.score_universe(top_n=top_n)
+        all_signals = signals.score_universe()
     except Exception as e:  # noqa: BLE001
         return [], f"score_universe raised: {type(e).__name__}: {e}"
+    if not all_signals:
+        return [], "no candidates passed the bullish-tech + positive-news gate"
+    # ``score_universe`` returns a list already sorted by combined
+    # desc; just take the head. Defensive sort in case the underlying
+    # order ever changes.
+    candidates = sorted(
+        list(all_signals),
+        key=lambda s: (
+            float(getattr(s, "combined", 0.0) or 0.0),
+            float(getattr(s, "confidence", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )[: max(0, int(top_n))]
     if not candidates:
         return [], "no candidates passed the bullish-tech + positive-news gate"
-    return list(candidates), None
+    return candidates, None
 
 
 def _size_candidates(
@@ -403,11 +440,11 @@ def run_morning(
         result.finished_at = iso_now()
         return result
 
-    # Step 1 — score the universe. If signals.combined is missing but
+    # Step 1 — score the universe. If signals is missing but
     # some other module is present, we treat *this step* as the
     # "not implemented" gate; downstream steps are skipped.
     if signals is None:
-        msg = "portfoliomind.signals.combined not implemented — strategy runner is a no-op"
+        msg = "portfoliomind.signals.score_universe not implemented — strategy runner is a no-op"
         log.info(msg)
         result.status = "not_implemented"
         result.finished_at = iso_now()
@@ -507,8 +544,8 @@ def set_factories(
     """Inject test fakes for the three lazy-imported modules.
 
     Production callers never invoke this. Tests use it to swap the
-    lazy-imported ``signals.combined`` / ``signals.sizer`` /
-    ``approval`` modules for in-memory fakes. The pattern mirrors
+    lazy-imported ``signals`` / ``signals.sizer`` / ``approval``
+    modules for in-memory fakes. The pattern mirrors
     card 3's ``set_factories`` in ``portfoliomind.xtb.runner``.
 
     Pass ``None`` for any factory to leave it alone. Call

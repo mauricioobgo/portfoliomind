@@ -67,6 +67,14 @@ REQUIRED_VARS: tuple[str, ...] = (
 OPTIONAL_VARS: tuple[str, ...] = (
     "SESSION_DIR",
     "SCREENSHOT_DIR",
+    "XTB_PER_TRADE_CAP",
+    "XTB_MAX_OPEN_POSITIONS",
+    "XTB_SL_PCT",
+    "XTB_TP_PCT",
+    "XTB_MAX_COMMISSION_PCT",
+    "APPROVAL_TIMEOUT_MIN",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_HOME_CHANNEL_THREAD_ID",
 )
 ALL_VARS: tuple[str, ...] = REQUIRED_VARS + OPTIONAL_VARS
 
@@ -175,6 +183,33 @@ def _resolve_service_account_json(raw: str) -> dict[str, Any]:
     return parsed_obj
 
 
+def _env_float(env: Mapping[str, str], name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` on missing/empty/invalid.
+
+    Card 7 sizing + approval config is operator-tunable via env. A
+    bad value is treated as the default rather than crashing the
+    morning run — the operator can fix it in the next iteration.
+    """
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
+    """Read an int env var, falling back to ``default`` on missing/empty/invalid."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class PortfoliomindConfig:
     """Strict, frozen view of all required + optional config.
@@ -211,6 +246,35 @@ class PortfoliomindConfig:
     # ``SIGNALS_CACHE_PATH`` env var (full path) — that takes
     # precedence over this directory default.
     signals_cache_dir: Path = field(default_factory=lambda: Path("./.cache"))
+
+    # Card 7 — Discord approval flow + position sizing. All values are
+    # sourced from env so an operator can re-tune without redeploying.
+    # Defaults match the operator-approved 2026-06-08 spec.
+    #
+    # * ``xtb_per_trade_cap`` — USD per ticker. The sizer rejects any
+    #   candidate that would exceed this dollar allocation.
+    # * ``xtb_max_open_positions`` — hard cap on concurrent open
+    #   positions. The sizer rejects the N+1th approval.
+    # * ``xtb_sl_pct`` / ``xtb_tp_pct`` — defaults for stop-loss and
+    #   take-profit, expressed as fractions of the entry price
+    #   (0.07 = 7% below entry, 0.14 = 14% above).
+    # * ``xtb_max_commission_pct`` — round-trip commission ceiling.
+    #   A candidate whose round-trip commission would exceed this
+    #   fraction of position value is rejected.
+    # * ``approval_timeout_min`` — how long the Discord approval
+    #   message waits for a reaction before treating no-reaction as
+    #   reject.
+    # * ``discord_bot_token`` / ``discord_home_channel_thread_id`` —
+    #   the same bot as the default profile, posting into a thread
+    #   inside the operator's home channel.
+    xtb_per_trade_cap: float = 200.0
+    xtb_max_open_positions: int = 5
+    xtb_sl_pct: float = 0.07
+    xtb_tp_pct: float = 0.14
+    xtb_max_commission_pct: float = 0.05
+    approval_timeout_min: int = 30
+    discord_bot_token: str = ""
+    discord_home_channel_thread_id: str = ""
 
     KNOWN_VARS: ClassVar[tuple[str, ...]] = ALL_VARS
 
@@ -265,6 +329,16 @@ class PortfoliomindConfig:
             openai_api_key=env_dict["OPENAI_API_KEY"],
             session_dir=Path(env_dict.get("SESSION_DIR", "./sessions")).expanduser(),
             screenshot_dir=Path(env_dict.get("SCREENSHOT_DIR", "./screenshots")).expanduser(),
+            xtb_per_trade_cap=_env_float(env_dict, "XTB_PER_TRADE_CAP", 200.0),
+            xtb_max_open_positions=_env_int(env_dict, "XTB_MAX_OPEN_POSITIONS", 5),
+            xtb_sl_pct=_env_float(env_dict, "XTB_SL_PCT", 0.07),
+            xtb_tp_pct=_env_float(env_dict, "XTB_TP_PCT", 0.14),
+            xtb_max_commission_pct=_env_float(env_dict, "XTB_MAX_COMMISSION_PCT", 0.05),
+            approval_timeout_min=_env_int(env_dict, "APPROVAL_TIMEOUT_MIN", 30),
+            discord_bot_token=env_dict.get("DISCORD_BOT_TOKEN", "").strip(),
+            discord_home_channel_thread_id=env_dict.get(
+                "DISCORD_HOME_CHANNEL_THREAD_ID", ""
+            ).strip(),
         )
 
     # --- Helpers ---
@@ -275,12 +349,18 @@ class PortfoliomindConfig:
 
     def __repr__(self) -> str:
         # CRITICAL: never echo secrets in repr/log. Only the sheet ID is
-        # safe to display.
+        # safe to display. Discord bot token is also a secret.
         return (
             f"PortfoliomindConfig("
             f"investingpro_email={self.investingpro_email!r}, "
             f"google_sheet_id={self.google_sheet_id!r}, "
             f"has_existing_sheet={self.has_existing_sheet()}, "
+            f"xtb_per_trade_cap={self.xtb_per_trade_cap}, "
+            f"xtb_max_open_positions={self.xtb_max_open_positions}, "
+            f"xtb_sl_pct={self.xtb_sl_pct}, "
+            f"xtb_tp_pct={self.xtb_tp_pct}, "
+            f"xtb_max_commission_pct={self.xtb_max_commission_pct}, "
+            f"approval_timeout_min={self.approval_timeout_min}, "
             f"session_dir={self.session_dir}, "
             f"screenshot_dir={self.screenshot_dir})"
         )
