@@ -725,3 +725,173 @@ class TestOutcomeSummaries:
             line = o.summary_line()
             assert isinstance(line, str)
             assert len(line) > 0
+
+
+# --- card 8: strategy runner integration ----------------------------------
+
+
+class TestMorningRunWithStrategyRunner:
+    """Card 8 wires the strategy runner into ``morning_run``.
+
+    Coverage:
+
+    * When the strategy runner returns ``status='not_implemented'``,
+      the morning job still completes cleanly — the strategy result
+      is treated as ``ok()`` and does not produce a card8 error.
+    * When the strategy runner returns ``picks_scraped=N`` /
+      ``orders_placed=M``, the morning outcome aggregates them with
+      the card 2 / card 3 totals.
+    * When the strategy runner raises, the morning job catches it
+      and records a ``card8 raised:`` error.
+    * When the strategy runner is the ONLY runner registered (card
+      2/3 still absent), ``morning_run`` still proceeds with
+      ``status='ran'`` (or 'skipped') instead of the
+      ``no_platform_modules`` short-circuit.
+    """
+
+    def test_strategy_not_implemented_does_not_break_morning_run(
+        self, monkeypatch
+    ):
+        """The strategy runner's ``not_implemented`` status is a
+        soft no-op — the morning job still aggregates the card 2
+        and card 3 totals without injecting a card8 error."""
+        from portfoliomind.config import PortfoliomindConfig
+        from portfoliomind.scheduler.jobs import MorningContext, MorningResult
+
+        from tests.conftest import full_env
+
+        fake_sheets = FakeSheetsClient()
+        cfg = PortfoliomindConfig.from_env(env=full_env(sheet_id=""))
+
+        def fake_inv(_ctx: MorningContext) -> MorningResult:
+            return MorningResult(runner="card2", picks_scraped=4)
+
+        def fake_xtb(_ctx: MorningContext) -> MorningResult:
+            return MorningResult(runner="card3", orders_placed=1)
+
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card2", lambda: fake_inv
+        )
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card3", lambda: fake_xtb
+        )
+
+        # The strategy runner is a no-op factory (its default state).
+        from portfoliomind import strategy_runner as strat_runner
+
+        monkeypatch.setattr(strat_runner, "_score_universe_factory", None)
+        monkeypatch.setattr(strat_runner, "_sizer_factory", None)
+        monkeypatch.setattr(strat_runner, "_approval_factory", None)
+        # The "any module registered" check uses _try_import_strategy
+        # which lazy-imports portfoliomind.strategy_runner.run_morning
+        # (the production entry point). The real run_morning returns
+        # status='not_implemented' on a clean factory state, so the
+        # check passes and the no_platform_modules short-circuit
+        # does NOT fire.
+
+        today = datetime(2026, 6, 8, 8, 30, tzinfo=JOBS_BOGOTA_TZ)
+        outcome = morning_run(config=cfg, sheets=fake_sheets, today=today)
+        # The job ran (not the no-platform short-circuit).
+        assert outcome.status != "no_platform_modules"
+        # No card8 error.
+        assert not any("card8" in e for e in outcome.errors), (
+            f"unexpected card8 error from not_implemented strategy: {outcome.errors!r}"
+        )
+
+    def test_strategy_aggregates_into_morning_outcome(self, monkeypatch):
+        """When the strategy runner produces counts, the morning
+        outcome sums them with the card 2/3 totals."""
+        from portfoliomind.config import PortfoliomindConfig
+        from portfoliomind.scheduler.jobs import MorningContext, MorningResult
+
+        from tests.conftest import full_env
+
+        fake_sheets = FakeSheetsClient()
+        cfg = PortfoliomindConfig.from_env(env=full_env(sheet_id=""))
+
+        # Inject a strategy that scored 7 candidates and persisted 2 rows.
+        from dataclasses import dataclass
+
+        @dataclass
+        class _StratRes:
+            status: str = "ran"
+            picks_scraped: int = 7
+            orders_placed: int = 2
+            approved_count: int = 5
+            rejected_count: int = 2
+            skipped: bool = False
+            skip_reason: str = ""
+            error: str = ""
+            errors: list = None  # type: ignore[assignment]
+
+            def __post_init__(self):
+                if self.errors is None:
+                    self.errors = []
+
+            def ok(self) -> bool:
+                return not self.error
+
+        def fake_strategy(_ctx: MorningContext) -> _StratRes:
+            return _StratRes()
+
+        def fake_inv(_ctx: MorningContext) -> MorningResult:
+            return MorningResult(runner="card2", picks_scraped=3)
+
+        def fake_xtb(_ctx: MorningContext) -> MorningResult:
+            return MorningResult(runner="card3", orders_placed=1)
+
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_strategy", lambda: fake_strategy
+        )
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card2", lambda: fake_inv
+        )
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card3", lambda: fake_xtb
+        )
+
+        today = datetime(2026, 6, 8, 8, 30, tzinfo=JOBS_BOGOTA_TZ)
+        outcome = morning_run(config=cfg, sheets=fake_sheets, today=today)
+        # Strategy scored 7, card2 scored 3 → 10 total.
+        assert outcome.picks_scraped == 10
+        # Strategy persisted 2, card3 placed 1 → 3 total.
+        assert outcome.orders_placed == 3
+        # Both runners reported success → outcome is "ran" (not "failed").
+        assert outcome.status == "ran"
+
+    def test_strategy_raises_records_card8_error(self, monkeypatch):
+        """If the strategy runner raises, ``morning_run`` records a
+        ``card8 raised:`` error and the rest of the morning job
+        still completes."""
+        from portfoliomind.config import PortfoliomindConfig
+        from portfoliomind.scheduler.jobs import MorningContext, MorningResult
+
+        from tests.conftest import full_env
+
+        fake_sheets = FakeSheetsClient()
+        cfg = PortfoliomindConfig.from_env(env=full_env(sheet_id=""))
+
+        def fake_strategy(_ctx: MorningContext) -> MorningResult:
+            raise RuntimeError("simulated strategy failure")
+
+        def fake_inv(_ctx: MorningContext) -> MorningResult:
+            return MorningResult(runner="card2", picks_scraped=3)
+
+        def fake_xtb(_ctx: MorningContext) -> MorningResult:
+            return MorningResult(runner="card3", orders_placed=1)
+
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_strategy", lambda: fake_strategy
+        )
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card2", lambda: fake_inv
+        )
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card3", lambda: fake_xtb
+        )
+
+        today = datetime(2026, 6, 8, 8, 30, tzinfo=JOBS_BOGOTA_TZ)
+        outcome = morning_run(config=cfg, sheets=fake_sheets, today=today)
+        assert outcome.status == "failed"
+        assert any("card8 raised" in e for e in outcome.errors)
+        assert any("simulated strategy failure" in e for e in outcome.errors)

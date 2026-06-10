@@ -31,6 +31,7 @@ from portfoliomind.config import ConfigError
 from portfoliomind.logging_setup import get_logger, setup_logging
 from portfoliomind.scheduler.jobs import morning_run
 from portfoliomind.scheduler.loop import (
+    DEFAULT_MORNING_CRON,
     DEFAULT_MORNING_HOUR,
     DEFAULT_MORNING_MINUTE,
     DEFAULT_RETURNS_HOUR,
@@ -68,13 +69,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--morning-hh",
         type=int,
         default=DEFAULT_MORNING_HOUR,
-        help="Override the morning job's hour-of-day (Bogota local).",
+        help="Override the morning job's hour-of-day (Bogota local). "
+        "Ignored when --morning-cron is set.",
     )
     parser.add_argument(
         "--morning-mm",
         type=int,
         default=DEFAULT_MORNING_MINUTE,
-        help="Override the morning job's minute-of-hour (Bogota local).",
+        help="Override the morning job's minute-of-hour (Bogota local). "
+        "Ignored when --morning-cron is set.",
+    )
+    parser.add_argument(
+        "--morning-cron",
+        type=str,
+        default="",
+        help=(
+            "Override the morning trigger with a 5-field cron expression "
+            "in UTC. The container is UTC; Colombia is UTC-5 year-round "
+            "(no DST), so 13:30 UTC = 08:30 Bogota. Default (empty) "
+            "builds the trigger from --morning-hh/--morning-mm in "
+            "America/Bogota with day_of_week=mon-fri. Example for "
+            "08:30 Bogota Mon-Fri: '%s'."
+        )
+        % DEFAULT_MORNING_CRON,
     )
     parser.add_argument(
         "--returns-hh",
@@ -124,14 +141,16 @@ def _run_daemon(args: argparse.Namespace) -> int:
     cfg = ScheduleConfig(
         morning_hour=args.morning_hh,
         morning_minute=args.morning_mm,
+        morning_cron=args.morning_cron,
         returns_hour=args.returns_hh,
         returns_minute=args.returns_mm,
     )
     log.info(
         "scheduler --daemon: starting "
-        "(morning=%02d:%02d returns=%02d:%02d Bogota)",
+        "(morning=%02d:%02d Bogota cron=%r returns=%02d:%02d Bogota)",
         cfg.morning_hour,
         cfg.morning_minute,
+        cfg.morning_cron or "",
         cfg.returns_hour,
         cfg.returns_minute,
     )

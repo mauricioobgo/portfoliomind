@@ -15,6 +15,7 @@ by the daemon CLI in :mod:`scripts.run_scheduler`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timezone
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -43,19 +44,58 @@ DEFAULT_MORNING_MINUTE: int = 30
 DEFAULT_RETURNS_HOUR: int = 16
 DEFAULT_RETURNS_MINUTE: int = 30
 
+# Default cron expression for the morning trigger, exposed as a
+# module-level constant so the operator-facing script
+# (:file:`scripts/register_cron.sh`) can reference a single source of
+# truth. The Bogota-local time the operator sees is 08:30 Mon-Fri;
+# the container is UTC, and Colombia does not observe DST, so the
+# UTC cron is fixed at ``30 13 * * 1-5`` year-round.
+#
+# (Bogota is UTC-5 year-round: 08:30 Bogota == 13:30 UTC. The
+# ``day_of_week='mon-fri'`` qualifier in :func:`build_morning_trigger`
+# encodes the Mon-Fri restriction at APScheduler level, not in the
+# cron string. The cron string here is a *reference* for
+# ``register_cron.sh`` which generates a Hermes-level ``hermes cron
+# create`` command; APScheduler itself still owns the timezone
+# handling via :data:`portfoliomind.time_utils.BOGOTA_TZ`.)
+DEFAULT_MORNING_CRON: str = "30 13 * * 1-5"
+
 
 @dataclass(frozen=True)
 class ScheduleConfig:
     """Tunable knobs for the cron schedule.
 
     All defaults match the v4 spec. Tests can override any field by
-    instantiating this class explicitly. The CLI exposes ``--morning-hh``,
-    ``--morning-mm``, ``--returns-hh``, ``--returns-mm`` for ad-hoc
-    overrides.
+    instantiating this class explicitly. The CLI exposes
+    ``--morning-cron`` (5-field cron expression, overrides
+    ``morning_hour``/``morning_minute`` when set), ``--returns-hh``
+    and ``--returns-mm`` for ad-hoc overrides.
+
+    The ``morning_cron`` field is the 5-field cron expression in
+    *UTC* (because the container runs UTC). Card 8 added it so the
+    operator can move the morning tick without rebuilding — e.g. to
+    shift the run from 13:30 UTC to 14:00 UTC during US summer when
+    the market effectively opens an hour later. The default
+    ``"30 13 * * 1-5"`` is what :func:`build_morning_trigger` builds
+    from ``morning_hour=8, morning_minute=30`` plus the
+    ``America/Bogota`` timezone.
+
+    When ``morning_cron`` is the empty string (the default), the
+    scheduler uses the ``morning_hour``/``morning_minute`` fields
+    with the ``day_of_week='mon-fri'`` restriction. When
+    ``morning_cron`` is non-empty, it is parsed as a 5-field cron
+    expression *in UTC* and used verbatim (the operator is
+    responsible for translating to their local time).
+
+    Colombia does not observe DST, so 13:30 UTC = 08:30 Bogota
+    year-round. Operators in other timezones should adjust
+    ``morning_cron`` accordingly and document the local-time
+    equivalent in their :file:`AGENTS.md`.
     """
 
     morning_hour: int = DEFAULT_MORNING_HOUR
     morning_minute: int = DEFAULT_MORNING_MINUTE
+    morning_cron: str = ""  # "" => use hour/minute + mon-fri restriction
     returns_hour: int = DEFAULT_RETURNS_HOUR
     returns_minute: int = DEFAULT_RETURNS_MINUTE
 
@@ -66,7 +106,22 @@ def build_morning_trigger(cfg: ScheduleConfig) -> CronTrigger:
     Exposed as a separate function so a test can assert that the trigger
     is wired to the right timezone + the right day-of-week without
     spinning up the full scheduler.
+
+    When ``cfg.morning_cron`` is non-empty, the trigger is built from
+    the raw 5-field cron expression in UTC (the container is UTC).
+    The operator is responsible for translating their local time to
+    UTC when overriding this. When ``cfg.morning_cron`` is empty
+    (the default), the trigger is built from ``morning_hour`` /
+    ``morning_minute`` with a ``day_of_week='mon-fri'`` restriction,
+    pinned to the ``America/Bogota`` timezone.
     """
+    if cfg.morning_cron:
+        # Parse the 5-field cron expression in UTC. APScheduler's
+        # ``from_crontab`` accepts the standard 5-field syntax with
+        # optional whitespace. We use it directly so the
+        # ``morning_cron`` override is verbatim — the operator typed
+        # exactly what they want.
+        return CronTrigger.from_crontab(cfg.morning_cron, timezone=timezone.utc)
     return CronTrigger(
         hour=cfg.morning_hour,
         minute=cfg.morning_minute,
@@ -166,4 +221,5 @@ __all__ = [
     "DEFAULT_MORNING_MINUTE",
     "DEFAULT_RETURNS_HOUR",
     "DEFAULT_RETURNS_MINUTE",
+    "DEFAULT_MORNING_CRON",
 ]
