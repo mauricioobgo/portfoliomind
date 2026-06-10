@@ -177,19 +177,76 @@ does not open a browser.
 
 The scheduler (card 4) runs two recurring jobs on Bogota-local time:
 
-| Job                 | Cadence                  | Bogota time | Action                                                                 |
-|---------------------|--------------------------|-------------|------------------------------------------------------------------------|
-| `morning_run`       | Mon–Fri (skip weekends)  | 08:30       | InvestingPro scrape → strategy picks → operator approval → XTB orders  |
-| `refresh_returns`   | Daily                    | 16:30       | yfinance lookup for every row in RETURNS_TRACKER; update + prune       |
+| Job                 | Cadence                  | Bogota time | UTC cron          | Action                                                                 |
+|---------------------|--------------------------|-------------|-------------------|------------------------------------------------------------------------|
+| `morning_run`       | Mon–Fri (skip weekends)  | 08:30       | `30 13 * * 1-5`   | Strategy picks → operator approval → XTB execution                     |
+| `refresh_returns`   | Daily                    | 16:30       | `30 21 * * *`     | yfinance lookup for every row in RETURNS_TRACKER; update + prune       |
 
 Both triggers are pinned to `zoneinfo.ZoneInfo("America/Bogota")` —
 NOT the host's local time. The production Docker image runs UTC, so
 the cron expressions are the only thing keeping the schedule on
 Colombia time.
 
+**Card 8 added a third layer to `morning_run` — the strategy
+runner.** The full morning pipeline is now:
+
+1. **Card 2 (InvestingPro scrape)** — runs first, reads the AI
+   Picks tab from InvestingPro.
+2. **Card 8 (strategy runner, `portfoliomind.strategy_runner`)** —
+   runs second: scores the universe (card 6), sizes the
+   candidates (card 7), posts to Discord for operator approval
+   (card 7), and persists the approved subset to
+   `APPROVED_TRADES`.
+3. **Card 3 (XTB execution)** — runs last, reads `APPROVED_TRADES`
+   and places the orders (dry-run by default).
+
+The strategy runner is lazy-imported with the same pattern as cards
+2 and 3 — if the card-6/7 modules are not yet on the import path,
+the strategy runner returns `status='not_implemented'` cleanly and
+the morning job continues. Card 8 therefore ships safely ahead of
+cards 6 and 7.
+
 The morning job also consults `PORTFOLIOMIND_HOLIDAYS` (comma-separated
 `YYYY-MM-DD` list) to skip configured market holidays. Default = no
 holidays (skip = false for every day except Sat/Sun).
+
+### `morning_cron` override
+
+The `ScheduleConfig` dataclass exposes a `morning_cron` field that
+overrides the default 08:30 Bogota Mon–Fri schedule with a raw
+5-field cron expression in UTC. Default = `""` (empty string),
+which falls through to the `morning_hour`/`morning_minute` path
+in `America/Bogota` with `day_of_week='mon-fri'`. Set
+`morning_cron` to a non-empty value to take over.
+
+```python
+from portfoliomind.scheduler.loop import ScheduleConfig
+
+# Default: 08:30 Bogota Mon-Fri via America/Bogota timezone.
+cfg = ScheduleConfig()
+
+# Override: 13:30 UTC Mon-Fri (= 08:30 Bogota, expressed in UTC
+# because the container runs UTC). The day_of_week is encoded in
+# the cron string itself.
+cfg = ScheduleConfig(morning_cron="30 13 * * 1-5")
+```
+
+The CLI exposes this as `--morning-cron`:
+
+```bash
+uv run python scripts/run_scheduler.py --daemon --morning-cron "30 13 * * 1-5"
+```
+
+The `DEFAULT_MORNING_CRON` constant is the canonical
+"08:30 Bogota Mon-Fri in UTC" expression. Reference it from the
+`scripts/register_cron.sh` registration script as the single
+source of truth — don't duplicate the string in docs and shell
+scripts.
+
+The container is UTC; Colombia does not observe DST, so the
+offset is fixed at UTC-5 year-round. Operators in other
+timezones should adjust `morning_cron` accordingly and document
+the local-time equivalent in their AGENTS.md.
 
 ## Cron deployment (long-running)
 
@@ -228,6 +285,57 @@ uv run python scripts/run_scheduler.py --once
 That runs the morning job once and exits with code 0 (ran/skipped) or
 4 (ran but had errors). It is the right entry point for the
 `hermes/scheduler` card's CI smoke test.
+
+### `scripts/register_cron.sh` — operator runs once
+
+The operator runs `scripts/register_cron.sh` once after deploying
+to register the scheduler under the `portfoliomind` Hermes
+profile. The script prints the exact `hermes cron create` command
+it would run and (with `--apply`) actually registers it.
+
+```bash
+# Dry-run: print the command without running it.
+bash scripts/register_cron.sh
+
+# Show a different cron expression.
+bash scripts/register_cron.sh --morning-cron "30 13 * * 1-5"
+
+# Actually register the cron job.
+bash scripts/register_cron.sh --apply
+```
+
+The script sources the canonical cron string from
+`DEFAULT_MORNING_CRON` via `python -c`, so the registration
+command and the in-process scheduler always agree. Don't hardcode
+the cron string in the shell — let the script import it.
+
+### Disabling a single trigger
+
+The cron job above registers a single daemon process that runs
+both jobs. To disable a single trigger without killing the
+daemon, override the `ScheduleConfig`:
+
+```bash
+# Run the daemon with no morning trigger; returns refresh still fires.
+uv run python scripts/run_scheduler.py --daemon --morning-hh 99 --morning-mm 99
+# (Note: APScheduler treats hour=99 as "never fire", so the morning
+#  job is effectively disabled. A cleaner approach is to set
+#  --morning-cron to a cron that never matches, e.g. "0 0 31 2 *".)
+```
+
+The "right" way to disable a single trigger is to use a cron
+expression that never matches, e.g. `0 0 31 2 *` (Feb 31 doesn't
+exist). The CLI flag `--morning-cron` takes any 5-field
+expression. The returns job is disabled the same way via
+`--returns-hh` / `--returns-mm` (no `--returns-cron` flag yet —
+add one in a follow-up card if needed).
+
+If the daemon is running under `hermes cron` and you need to
+disable the whole pipeline (both triggers), the right knob is:
+
+```bash
+hermes cron pause portfoliomind-scheduler
+```
 
 ## Conventions
 
@@ -270,7 +378,7 @@ Card 4 adds one optional env var:
   dates on which `morning_run` should be skipped. Bad entries are logged
   and ignored; a typo never takes the morning job offline.
 
-## Things still in scope for future cards (not done in cards 1-4)
+## Things still in scope for future cards (not done in cards 1-8)
 
 - Card 2: InvestingPro runner (`portfoliomind.investingpro.runner`) —
   done. Wires login + scrape + deep-dive into the morning-run seam.
@@ -287,6 +395,13 @@ Card 4 adds one optional env var:
   sentiment → single `Signal(ticker, combined, technical, sentiment,
   confidence, reasons)` in [-1, +1]. Card 7 (Discord approval) and
   card 8 (morning-run wiring) consume this.
+- Card 7: Position sizer + Discord interactive approval — in
+  progress. Will produce the `PositionSizer` and
+  `post_candidates_and_collect_reactions` functions the strategy
+  runner lazy-imports.
+- Card 8 (this card): Strategy runner wiring — done. The
+  runner is the integration seam that will activate automatically
+  once card 7 lands.
 - Real trading logic, scoring weights, R/R checks, KB-5
   disqualifications.
 - Paper-to-live account migration.

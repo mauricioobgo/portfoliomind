@@ -292,6 +292,29 @@ def _try_import_card3() -> Optional[_PlatformRunner]:
     return getattr(xtb_runner, "run_morning", None)
 
 
+def _try_import_strategy() -> Optional[_PlatformRunner]:
+    """Try to import the card 8 (strategy) runner.
+
+    The strategy runner is the third leg of the morning pipeline: it
+    scores the universe (card 6), sizes the candidates (card 7), posts
+    to Discord for operator approval (card 7), and persists the
+    approved subset to ``APPROVED_TRADES`` for the XTB runner to pick
+    up on its next tick.
+
+    Same lazy-import pattern as card 2/3: if the module isn't installed
+    (e.g. card 8 hasn't shipped) the job logs ``not_implemented`` and
+    exits cleanly. The card 8 module's :func:`run_morning` is also
+    defensively ``not_implemented``-aware at the strategy-layer: even
+    if card 8 ships, the inner signals/sizer/approval imports may
+    still be pending, and the runner will degrade gracefully.
+    """
+    try:
+        from ..strategy_runner import run_morning as strategy_run  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return strategy_run
+
+
 def morning_run(
     *,
     config: Optional[PortfoliomindConfig] = None,
@@ -389,10 +412,16 @@ def morning_run(
     # Lazy-import the platform runners. If neither is present yet, the
     # job logs a clear "not implemented" line and exits cleanly. This
     # lets card 4 ship ahead of cards 2/3 without breaking the schedule.
+    # The card 8 (strategy) runner is also lazy-imported: when the
+    # card-6/7 modules are still missing the strategy runner returns
+    # ``status='not_implemented'`` cleanly so the morning job keeps
+    # ticking. See ``_try_import_strategy`` and
+    # ``portfoliomind.strategy_runner`` for details.
     inv_runner = _try_import_card2()
     xtb_runner = _try_import_card3()
-    if inv_runner is None and xtb_runner is None:
-        msg = "morning_run: no platform runners (card 2/3 modules) registered — skipping"
+    strategy_runner = _try_import_strategy()
+    if inv_runner is None and xtb_runner is None and strategy_runner is None:
+        msg = "morning_run: no runners (card 2/3/8 modules) registered — skipping"
         log.info(msg)
         log_to_sheet("INFO", msg)
         return MorningOutcome(
@@ -421,6 +450,33 @@ def morning_run(
                 errors.append(f"card2:{res.error}")
         except Exception as e:  # noqa: BLE001
             errors.append(f"card2 raised: {type(e).__name__}: {e}")
+
+    # Card 8 (strategy) runs BEFORE card 3 (XTB execution) so that the
+    # approved trades are persisted to APPROVED_TRADES first; the XTB
+    # runner then reads them on the same tick. The strategy runner
+    # returns a StrategyResult (its own dataclass with the same
+    # shape) which we unwrap into the morning summary fields. The
+    # ``picks_scraped`` field is repurposed to count the candidates
+    # score_universe produced; ``orders_placed`` counts the rows
+    # persisted to APPROVED_TRADES.
+    if strategy_runner is not None:
+        try:
+            # The strategy runner's return type is StrategyResult, not
+            # MorningResult — it has the same fields plus an extra
+            # ``errors`` list. We can't reuse the _PlatformRunner
+            # Protocol because it pins the return type to
+            # MorningResult, so we cast to Any and unwrap manually.
+            strat_res: Any = strategy_runner(ctx)
+            picks_scraped += getattr(strat_res, "picks_scraped", 0)
+            orders_placed += getattr(strat_res, "orders_placed", 0)
+            if not getattr(strat_res, "ok", lambda: True)():
+                err_text = getattr(strat_res, "error", "") or (
+                    strat_res.errors[0] if getattr(strat_res, "errors", None) else ""
+                )
+                if err_text:
+                    errors.append(f"card8:{err_text}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"card8 raised: {type(e).__name__}: {e}")
 
     if xtb_runner is not None:
         try:
