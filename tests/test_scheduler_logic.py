@@ -388,33 +388,82 @@ class TestMorningRunLazyConfig:
 
 
 class TestMorningRunNoPlatformModules:
-    """When card 2 / card 3 haven't been implemented yet, the morning
-    job should log ``not_implemented`` and exit with
-    ``no_platform_modules`` — never crash the schedule."""
+    """Cards 2 + 3 are now implemented: ``portfoliomind.investingpro.runner``
+    and ``portfoliomind.xtb.runner`` both expose ``run_morning``. The
+    morning job should pick them up, NOT log "no platform runners
+    registered". When both runners fail (e.g. the test environment
+    has no real Google Sheets), the job still completes — it just
+    surfaces the errors.
+    """
 
-    def test_no_modules_status(self, monkeypatch):
-        # Provide a valid config but with no sheet; the lazy import
-        # of card 2/3 modules will fail and the function will return
-        # no_platform_modules.
+    def test_runners_are_picked_up(self, monkeypatch):
+        """``morning_run`` finds the runner modules and calls them.
+        Both runners are invoked, both fail (no real Sheets in this
+        test), and the outcome is ``failed`` with one error per
+        runner.
+        """
         from portfoliomind.config import PortfoliomindConfig
         from tests.conftest import full_env
-        # Use a fake SheetsClient so the AGENT_LOG write doesn't hit
-        # the real Google API.
+
         fake_sheets = FakeSheetsClient()
         cfg = PortfoliomindConfig.from_env(env=full_env(sheet_id=""))
-        # Card 2/3 don't exist in this test environment, so the
-        # _try_import_cardN helpers return None and the function
-        # returns "no_platform_modules" — but only if the AGENT_LOG
-        # write inside the no-platform path doesn't raise. The fake
-        # client swallows the write, so the path is clean.
         today = datetime(2026, 6, 8, 8, 30, tzinfo=JOBS_BOGOTA_TZ)
         outcome = morning_run(config=cfg, sheets=fake_sheets, today=today)
-        assert outcome.status == "no_platform_modules"
-        # The agent log got a row.
+        # The runners are wired up. The job ran (status: "failed"
+        # because both runners errored in the no-Sheets test env, but
+        # NOT "no_platform_modules" — that path is gone).
+        assert outcome.status == "failed"
+        # The two errors are one per runner, not the
+        # no-platform-modules skip path.
+        assert any("card2" in e for e in outcome.errors)
+        assert any("card3" in e for e in outcome.errors)
+        # Crucially: the "no platform runners" line is NOT in the
+        # agent log anymore.
         rows = fake_sheets._tables.get("🗒️ Agent Log", [])
-        assert any("no platform runners" in r[3] for r in rows), (
-            f"expected 'no platform runners' in AGENT_LOG row, got: {rows!r}"
+        assert not any("no platform runners" in r[3] for r in rows), (
+            f"unexpected 'no platform runners' line in AGENT_LOG: {rows!r}"
         )
+
+    def test_runners_can_be_replaced_with_fakes(self, monkeypatch):
+        """Inject fake runners that return known results, then check
+        that ``morning_run`` aggregates their ``picks_scraped`` /
+        ``orders_placed`` correctly.
+        """
+        from portfoliomind.scheduler.jobs import MorningContext, MorningResult
+
+        from portfoliomind.config import PortfoliomindConfig
+        from tests.conftest import full_env
+
+        fake_sheets = FakeSheetsClient()
+        cfg = PortfoliomindConfig.from_env(env=full_env(sheet_id=""))
+
+        def fake_inv(ctx: MorningContext) -> MorningResult:
+            return MorningResult(
+                runner="card2", picks_scraped=7, error="",
+            )
+
+        def fake_xtb(ctx: MorningContext) -> MorningResult:
+            return MorningResult(
+                runner="card3", orders_placed=2, error="",
+            )
+
+        # Patch the lazy-import seam directly.
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card2",
+            lambda: fake_inv,
+        )
+        monkeypatch.setattr(
+            "portfoliomind.scheduler.jobs._try_import_card3",
+            lambda: fake_xtb,
+        )
+
+        today = datetime(2026, 6, 8, 8, 30, tzinfo=JOBS_BOGOTA_TZ)
+        outcome = morning_run(config=cfg, sheets=fake_sheets, today=today)
+
+        assert outcome.status == "ran"
+        assert outcome.picks_scraped == 7
+        assert outcome.orders_placed == 2
+        assert outcome.errors == []
 
 
 # --- refresh_returns math + pruning ----------------------------------------
