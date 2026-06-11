@@ -4,7 +4,9 @@ Coverage:
 
 * :func:`run_morning` returns ``status='not_implemented'`` when the
   card-6/7 modules (signals, sizer, approval) are absent on the
-  import path — the production state right now.
+  import path. The real modules exist now, so the tests simulate
+  the missing-module state by monkeypatching the ``_try_import_*``
+  helpers — the code path still matters for partial deployments.
 * :func:`run_morning` runs end-to-end when the test factories are
   installed: score → size → post → collect → persist. Asserts every
   field on the returned :class:`StrategyResult`.
@@ -168,7 +170,16 @@ def _clear_factories():
 
 class TestNotImplementedPath:
     """When the card-6/7 modules are not on the import path, the
-    runner returns ``status='not_implemented'`` and exits cleanly."""
+    runner returns ``status='not_implemented'`` and exits cleanly.
+
+    The real modules ship now, so the tests simulate the
+    missing-module state by patching the lazy-import helpers."""
+
+    @pytest.fixture(autouse=True)
+    def _no_modules(self, monkeypatch):
+        monkeypatch.setattr(strat, "_try_import_signals", lambda: None)
+        monkeypatch.setattr(strat, "_try_import_sizer", lambda: None)
+        monkeypatch.setattr(strat, "_try_import_approval", lambda: None)
 
     def test_default_run_returns_not_implemented(self):
         result = strat.run_morning()
@@ -192,6 +203,19 @@ class TestNotImplementedPath:
         is a no-op, but it should not raise."""
         result = strat.run_morning(top_n=10)
         assert result.status == "not_implemented"
+
+    def test_real_modules_are_importable(self):
+        """Without the patch, the production lazy imports now resolve —
+        the card-6/7 gap is closed."""
+        # NOTE: these call the real helpers, bypassing the fixture's
+        # patched module attributes via direct import.
+        from portfoliomind.signals import combined, sizer  # noqa: F401
+        from portfoliomind import approval  # noqa: F401
+
+        assert hasattr(combined, "score_universe")
+        assert callable(sizer.PositionSizer)
+        assert hasattr(approval, "post_candidates_and_collect_reactions")
+        assert hasattr(approval, "persist_approved_trades")
 
 
 # --- End-to-end happy path -------------------------------------------------
@@ -409,7 +433,7 @@ class TestFailureIsolation:
 class TestFactoryManagement:
     """The set/reset_factories seam is hermetic and reversible."""
 
-    def test_set_factories_only_overrides_passed_args(self):
+    def test_set_factories_only_overrides_passed_args(self, monkeypatch):
         """Passing None for an arg leaves the previous value alone.
 
         The test installs only the signals factory, then only the
@@ -417,8 +441,10 @@ class TestFactoryManagement:
         the signals factory survived the second ``set_factories``
         call). The run still ends as ``skipped`` because the
         approval factory was never installed — that is the
-        expected behavior.
+        expected behavior. The real approval module exists now, so
+        we patch its lazy import away to keep the test hermetic.
         """
+        monkeypatch.setattr(strat, "_try_import_approval", lambda: None)
         strat.set_factories(
             score_universe_factory=_fake_signals_module([FakeCandidate("A")])
         )
@@ -434,14 +460,18 @@ class TestFactoryManagement:
         assert result.status == "skipped"
         assert "approval" in result.skip_reason.lower()
 
-    def test_reset_factories_clears_all(self):
-        """After reset, the runner is back to not_implemented."""
+    def test_reset_factories_clears_all(self, monkeypatch):
+        """After reset, the runner falls back to the lazy-import path
+        (patched to None here so the test stays hermetic)."""
         strat.set_factories(
             score_universe_factory=_fake_signals_module([FakeCandidate("A")]),
             sizer_factory=_fake_sizer_class(),
             approval_factory=_fake_approval_module(FakeApprovalOutcome()),
         )
         strat.reset_factories()
+        monkeypatch.setattr(strat, "_try_import_signals", lambda: None)
+        monkeypatch.setattr(strat, "_try_import_sizer", lambda: None)
+        monkeypatch.setattr(strat, "_try_import_approval", lambda: None)
         result = strat.run_morning()
         assert result.status == "not_implemented"
 
@@ -451,3 +481,61 @@ class TestFactoryManagement:
         assert callable(strat.set_factories)
         assert callable(strat.reset_factories)
         assert hasattr(strat, "StrategyResult")
+
+
+# --- Real-module pipeline ----------------------------------------------------
+
+
+class TestRealPipeline:
+    """End-to-end through the REAL combined/sizer/approval modules with
+    only the I/O seams (yfinance fetch, sentiment, SheetsClient) faked.
+    This is the production path the morning job takes now that the
+    card-6/7 gap is closed."""
+
+    def test_morning_run_through_real_modules(self, monkeypatch):
+        from portfoliomind import approval
+        from portfoliomind.sheets.schema import AGENT_LOG, APPROVED_TRADES, SUGGESTIONS
+        from portfoliomind.signals import combined
+
+        # Bullish series: recent golden cross + uptrend stack.
+        series = [160.0 - i for i in range(60)] + [101.0 + 2.0 * (i + 1) for i in range(20)]
+        monkeypatch.setattr(combined, "fetch_ohlcv", lambda ticker: series)
+        monkeypatch.setattr(combined, "_default_sentiment_fn", lambda: (lambda t: 0.2))
+        monkeypatch.setenv("PORTFOLIOMIND_EQUITY", "10000")
+
+        class FakeSheets:
+            def __init__(self):
+                self.data = {
+                    SUGGESTIONS: [
+                        # Standing mandate: SPY only (first universe ticker).
+                        ["ts", "SPY", "BUY", "", "HIGH", "operator", "", "ACTIVE"],
+                    ],
+                    APPROVED_TRADES: [],
+                    AGENT_LOG: [],
+                }
+
+            def read_range(self, sheet_id, tab, a1):
+                return [list(r) for r in self.data.get(tab, [])]
+
+            def append_rows(self, sheet_id, tab, values):
+                self.data.setdefault(tab, []).extend(values)
+                return len(self.data[tab])
+
+        sheets = FakeSheets()
+        approval.set_clients(sheets=sheets, sheet_id="sid")
+        try:
+            result = strat.run_morning(top_n=2)
+        finally:
+            approval.reset_clients()
+
+        assert result.status == "ran", f"errors: {result.errors}"
+        assert result.picks_scraped == 2
+        # Only SPY has a mandate row → exactly 1 approved, 1 rejected.
+        assert result.approved_count == 1
+        assert result.rejected_count == 1
+        assert result.orders_placed == 1
+        # The approved trade landed in the sheet with SPY in the Ticker column.
+        rows = sheets.data[APPROVED_TRADES]
+        assert len(rows) == 1 and rows[0][1] == "SPY"
+        # The audit trail recorded both decisions.
+        assert len(sheets.data[AGENT_LOG]) == 2
