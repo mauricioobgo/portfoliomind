@@ -66,8 +66,16 @@ uv run python scripts/bootstrap_sheet.py
 # 2) Smoke-test the Sheets integration: write one timestamped row to each tab.
 uv run python scripts/dry_run.py
 
-# 3) Run the LLM agent loop (dry-run by default — see the two-toggle gate).
+# 3) Run the primary LLM agent loop (dry-run by default — see the two-toggle gate).
 uv run python scripts/run_agent.py
+
+# 4) Run the INDEPENDENT validator agent — re-checks the proposed trades and
+#    brings you an APPROVE / FLAG / REJECT report for the final call.
+uv run python scripts/run_validator.py
+
+# 5) Backtest the bullish-pattern strategy (whole universe, or named tickers).
+uv run python scripts/backtest.py
+uv run python scripts/backtest.py AAPL MSFT NVDA --period 5y
 ```
 
 `bootstrap_sheet.py` prints `(sheet_id, sheet_url)` to stdout. Re-run it as
@@ -138,6 +146,39 @@ reasoning rules, hard guardrails) and a 10-skill registry
 code both enforce: long-only, mandate-only, SL/TP mandatory, the agent
 cannot enable live trading itself, secrets never logged, every decision
 audited to 🗒️ Agent Log.
+
+## Backtesting
+
+`portfoliomind.backtest` walk-forward replays each ticker's historical
+closes through the same pattern detector and vol-anchored stops the live
+strategy uses, with no look-ahead. The headline metric is the
+**calibration gap** — how far the model's claimed `p_bullish` sat above
+the realized win rate — which is the empirical check on the pattern
+hit-rate priors. It also reports win rate, expectancy, profit factor, max
+drawdown, and a per-pattern win-rate breakdown so you can see which setups
+actually pay. `scripts/backtest.py` runs a single ticker or sweeps the
+whole universe. The engine is pure Python over a list of closes (`fetch`
+injected), so it is hermetic in tests.
+
+## The independent validator agent
+
+`scripts/run_validator.py` runs a **second, separate agent** that executes
+*after* the primary agent has done the news + technical analysis and
+proposed sized trades. It is a deliberate second set of eyes with
+separation of duties:
+
+- It re-derives the evidence instead of trusting the primary scores:
+  re-checks news sentiment, runs a backtest to confirm the pattern has a
+  positive out-of-sample edge, and checks reward:risk and concentration
+  (`portfoliomind.validation`).
+- It produces a per-trade **APPROVE / FLAG / REJECT** verdict. Hard checks
+  (broken SL/TP, negative news, negative historical edge, over the
+  concentration cap) reject; soft concerns (thin backtest sample, weak
+  R:R, overconfident probability vs. backtest) flag.
+- It **cannot execute** — its skill registry has no execution skill by
+  design. It records every verdict to 🗒️ Agent Log (REJECTs also to
+  🚫 Disqualified) and presents the report to you for the final go/no-go.
+  The validator advises; you decide.
 
 See `src/portfoliomind/sheets/schema.py` for the exact column headers of
 each tab. The Returns Tracker columns are pinned verbatim from the v4

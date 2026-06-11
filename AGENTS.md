@@ -478,6 +478,55 @@ Handlers **never raise** — the model always receives a structured
 The `not_implemented` path still exists for partial deployments and
 is tested by monkeypatching the `_try_import_*` helpers.
 
+## Card 10 — backtesting + independent validation agent
+
+Card 10 adds an empirical-validation layer and a separate reviewer
+agent that sits between "trades proposed" and "trades executed".
+
+### `portfoliomind.backtest`
+
+Walk-forward backtester. `backtest_closes(ticker, closes)` is pure
+(no I/O, never raises): at each bar it runs the real
+`detect_bullish_patterns` on `closes[:i+1]` (no look-ahead), enters a
+long when `p_bullish >= entry_p_threshold`, and exits on the same
+vol-anchored SL / 2:1 TP the live sizer uses, one position at a time.
+Closes-only, so gaps through the stop are booked at the actual close
+(pessimistic, never optimistic). Aggregates win rate, expectancy,
+profit factor, max drawdown, per-pattern win rate, and the headline
+**`calibration_gap = avg_p_bullish - win_rate`** — the empirical test
+of the pattern hit-rate priors. `backtest_ticker` adds the yfinance
+fetch (injected in tests); `backtest_universe` pools trades across the
+universe. CLI: `scripts/backtest.py`.
+
+### `portfoliomind.validation`
+
+The independent deterministic gate. `validate_trade(order)` re-derives
+evidence rather than trusting the primary pipeline: iron rules (hard),
+reward:risk (soft/hard), an independent news re-check (hard — negative
+news vetoes), backtest support (hard — negative historical edge
+rejects; thin samples flag), calibration (soft — overconfident model
+flags), and concentration (hard). Decision: any hard fail → `REJECT`,
+else any soft fail → `FLAG`, else `APPROVE`. `sentiment_fn` and
+`backtest_fn` injected → hermetic. Never raises.
+
+### `portfoliomind.agent.validator`
+
+The second agent, separate from `agent.skills`. `VALIDATOR_SYSTEM_PROMPT`
+casts it as a skeptical, evidence-driven risk reviewer that runs after
+the primary analysis. Its 5-skill registry (`read_proposed_trades`,
+`backtest_ticker`, `recheck_news`, `validate_trade`,
+`record_validation`) has **no execution skill** — separation of duties
+is structural, not just prompt-level (there's a test asserting the
+registry contains no order-placing skill). REJECTs are written to
+`🚫 Disqualified`; every verdict to `🗒️ Agent Log`. The loop ends by
+presenting an APPROVE / FLAG / REJECT report and asking the user for
+the final go/no-go. CLI: `scripts/run_validator.py`.
+
+The intended operating flow is two agents in series: the primary agent
+proposes (writes `✅ Approved Trades`), the validator independently
+vets and reports, the **user** decides, and only then does the XTB
+executor run.
+
 ## Failure alerting (card 4)
 
 The morning and returns jobs both log a one-line `summary_line()` to
