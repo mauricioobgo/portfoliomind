@@ -1,13 +1,19 @@
 # PortfolioMind v4
 
-Multi-strategy equity investing agent. Pulls AI picks from InvestingPro, scores
-them under a configurable per-regime strategy, executes user-approved orders
-via XTB xStation 5, and tracks the full lifecycle in a Google Sheet.
+Multi-strategy equity investing agent focused on **long-only bullish-pattern
+setups**. Pulls AI picks from InvestingPro, scans the universe for bullish
+chart patterns with a probabilistic (log-odds) scoring model, vetoes setups
+on negative news sentiment, sizes positions with fractional Kelly, executes
+operator-mandated orders via XTB xStation 5, and tracks the full lifecycle
+in a Google Sheet.
 
-This repository is split into four cards. **Card 1 (this branch) ships the
-foundation**: project scaffold, typed config loader, Google Sheets client +
-schema + bootstrap, and a dry-run script. Cards 2/3/4 add the InvestingPro
-scraper, the XTB trade executor, and the scheduler respectively.
+The strategy pipeline is fully wired: technical indicators + bullish
+patterns + LLM news sentiment → candidate gates → fractional-Kelly sizing →
+Suggestions-mandate approval → XTB execution (dry-run by default). An LLM
+agent layer (`portfoliomind.agent`) carries the operating prompt and the
+skill registry that lets a tool-calling model drive the whole workflow —
+logging in to Google Sheets (service account), InvestingPro, and XTB on the
+operator's behalf, strictly inside hard guardrails.
 
 ## Prerequisites
 
@@ -43,9 +49,10 @@ sources win).
 | `XTB_PASSWORD` | yes | card 3 |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | yes | card 1 (and cards 2/3/4) |
 | `GOOGLE_SHEET_ID` | yes (blank allowed) | card 1 |
-| `OPENAI_API_KEY` | yes (validated, not exercised in card 1) | future strategy / narrative cards |
+| `OPENAI_API_KEY` | yes | news sentiment (card 5) + the LLM agent loop |
 | `SESSION_DIR` | no (default `./sessions`) | card 2 (Playwright cookies) |
 | `SCREENSHOT_DIR` | no (default `./screenshots`) | card 3 (pre-trade screenshots) |
+| `PORTFOLIOMIND_EQUITY` | no (default `10000`) | fractional-Kelly position sizer |
 
 `GOOGLE_SERVICE_ACCOUNT_JSON` accepts either an absolute path to a JSON file
 or the raw JSON contents inline. Path form is recommended.
@@ -53,11 +60,14 @@ or the raw JSON contents inline. Path form is recommended.
 ## Usage
 
 ```bash
-# 1) Create the sheet (or verify the existing one) and ensure all 11 tabs.
+# 1) Create the sheet (or verify the existing one) and ensure all 12 tabs.
 uv run python scripts/bootstrap_sheet.py
 
 # 2) Smoke-test the Sheets integration: write one timestamped row to each tab.
 uv run python scripts/dry_run.py
+
+# 3) Run the LLM agent loop (dry-run by default — see the two-toggle gate).
+uv run python scripts/run_agent.py
 ```
 
 `bootstrap_sheet.py` prints `(sheet_id, sheet_url)` to stdout. Re-run it as
@@ -89,6 +99,45 @@ Both scripts accept these flags:
 | 📊 Forecast Accuracy | Closed position actuals vs. all forecast models | On close |
 | 📰 Macro Context | VIX, SPY, Fed rate, sector RS, regime | Per session |
 | 🗒️ Agent Log | Full audit trail of all actions, decisions, model weight changes | Continuous |
+| 💡 Suggestions | The operator's standing mandate: tickers the agent MAY buy, with allocation caps | Operator-edited |
+
+## The bullish-pattern strategy
+
+The morning strategy run (`portfoliomind.signals.combined.score_universe`)
+qualifies long-only candidates through four gates:
+
+1. **Bullish-tech gate** — positive technical score (SMA trend + RSI
+   momentum + vol regime).
+2. **Pattern gate** — `portfoliomind.signals.patterns` scans for golden
+   cross, 55-day breakout, RSI oversold recovery, MACD bull cross, higher
+   lows, pullback bounce, and uptrend stack. Detected patterns are folded
+   into a posterior probability of upside `p_bullish` via shrunk log-odds
+   aggregation; the gate requires `p_bullish ≥ 0.55`.
+3. **Positive-news gate** — LLM news sentiment must not be negative.
+4. **Strength gate** — the blended score (0.40 technical + 0.35 patterns
+   + 0.25 sentiment) must clear 0.15.
+
+Qualified candidates are sized by `portfoliomind.signals.sizer.PositionSizer`
+(quarter-Kelly on `p_bullish` at 2:1 reward:risk, 3σ vol-anchored stops,
+hard 10% per-position cap), then matched against the **💡 Suggestions**
+mandate: a trade is approved only when its ticker has an `ACTIVE` `BUY`
+row, clamped to the row's `Max Allocation ($)`. Approved trades flow to
+✅ Approved Trades and the XTB executor (dry-run unless the operator
+enables the two-toggle live gate).
+
+## The LLM agent
+
+`portfoliomind.agent` ships the operating prompt
+(`AGENT_SYSTEM_PROMPT` — mission, authorized accounts, probabilistic
+reasoning rules, hard guardrails) and a 10-skill registry
+(`connect_google_sheets`, `login_investingpro`, `login_xtb`,
+`read_suggestions`, `scan_bullish_patterns`, `analyze_news`,
+`score_universe`, `propose_trades`, `execute_approved_trades`,
+`log_action`) exposed as OpenAI function-calling tools.
+`scripts/run_agent.py` runs the tool loop. Guardrails the prompt and the
+code both enforce: long-only, mandate-only, SL/TP mandatory, the agent
+cannot enable live trading itself, secrets never logged, every decision
+audited to 🗒️ Agent Log.
 
 See `src/portfoliomind/sheets/schema.py` for the exact column headers of
 each tab. The Returns Tracker columns are pinned verbatim from the v4

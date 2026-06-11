@@ -1,7 +1,7 @@
-"""Sheet schema: 11 tabs and their column headers.
+"""Sheet schema: 12 tabs and their column headers.
 
 These are the single source of truth for tab names and column definitions
-across all four PortfolioMind cards. The bootstrap and dry-run scripts both
+across all PortfolioMind cards. The bootstrap and dry-run scripts both
 import from here; the upcoming cards (2/3/4) will too.
 
 Column header conventions:
@@ -33,6 +33,7 @@ RETURNS_TRACKER: Final[str] = "💰 Returns Tracker"
 FORECAST_ACCURACY: Final[str] = "📊 Forecast Accuracy"
 MACRO_CONTEXT: Final[str] = "📰 Macro Context"
 AGENT_LOG: Final[str] = "🗒️ Agent Log"
+SUGGESTIONS: Final[str] = "💡 Suggestions"
 
 TAB_NAMES: Final[tuple[str, ...]] = (
     RAW_PICKS,
@@ -46,9 +47,10 @@ TAB_NAMES: Final[tuple[str, ...]] = (
     FORECAST_ACCURACY,
     MACRO_CONTEXT,
     AGENT_LOG,
+    SUGGESTIONS,
 )
 
-assert len(TAB_NAMES) == 11, f"Expected exactly 11 tabs, got {len(TAB_NAMES)}"
+assert len(TAB_NAMES) == 12, f"Expected exactly 12 tabs, got {len(TAB_NAMES)}"
 
 # --- Column headers per tab -------------------------------------------------
 
@@ -201,6 +203,19 @@ TAB_HEADERS: Final[dict[str, list[str]]] = {
         "Module",
         "Message",
     ],
+    SUGGESTIONS: [
+        # The operator's standing investment mandate. The approval layer
+        # auto-approves a sized order only when its ticker has a row here
+        # with Action=BUY and Status=ACTIVE, clamped to the allocation cap.
+        "Timestamp",
+        "Ticker",
+        "Action",
+        "Max Allocation ($)",
+        "Conviction",
+        "Source",
+        "Notes",
+        "Status",
+    ],
 }
 
 # Sanity: every tab name has a header list of the same length key.
@@ -223,4 +238,5 @@ __all__ = [
     "FORECAST_ACCURACY",
     "MACRO_CONTEXT",
     "AGENT_LOG",
+    "SUGGESTIONS",
 ]

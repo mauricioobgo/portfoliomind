@@ -39,6 +39,10 @@ Design constraints (from the card 6 spec):
 from __future__ import annotations
 
 from .cache import TechnicalCache
+from .combined import (
+    Candidate,
+    score_universe as score_bullish_universe,
+)
 from .combiner import (
     MIN_HISTORY_BARS,
     WEIGHT_SENTIMENT,
@@ -47,6 +51,16 @@ from .combiner import (
     SignalError,
     score_ticker,
     score_universe,
+)
+from .patterns import (
+    BullishPatterns,
+    PatternHit,
+    detect_bullish_patterns,
+)
+from .sizer import (
+    PositionSizer,
+    SizingError,
+    TradeOrder,
 )
 from .technicals import (
     RSI_OVERSOLD,
@@ -75,9 +89,17 @@ __all__ = [
     "SignalError",
     "TechnicalScore",
     "TechnicalsError",
+    "Candidate",
+    "BullishPatterns",
+    "PatternHit",
+    "TradeOrder",
+    "PositionSizer",
+    "SizingError",
     # Public functions
     "score_ticker",
     "score_universe",
+    "score_bullish_universe",
+    "detect_bullish_patterns",
     "compute_technical_score",
     "fetch_ohlcv",
     # Cache

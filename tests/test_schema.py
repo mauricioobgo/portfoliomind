@@ -14,13 +14,14 @@ from portfoliomind.sheets.schema import (
     RETURNS_TRACKER,
     SIGNAL_SCORECARD,
     STRATEGY_SELECTION,
+    SUGGESTIONS,
     TAB_HEADERS,
     TAB_NAMES,
 )
 
 
-def test_exactly_eleven_tabs():
-    assert len(TAB_NAMES) == 11
+def test_exactly_twelve_tabs():
+    assert len(TAB_NAMES) == 12
 
 
 def test_tab_names_contain_required_emoji_prefixes():
@@ -36,6 +37,7 @@ def test_tab_names_contain_required_emoji_prefixes():
         FORECAST_ACCURACY: "Forecast Accuracy",
         MACRO_CONTEXT: "Macro Context",
         AGENT_LOG: "Agent Log",
+        SUGGESTIONS: "Suggestions",
     }
     for tab, sub in expected_substrings.items():
         assert sub in tab, f"tab {tab!r} should contain {sub!r}"
@@ -91,3 +93,11 @@ def test_agent_log_has_minimum_columns():
 def test_returns_tracker_includes_vs_spy():
     """v4 spec section 'Returns Tracker' explicitly requires vs SPY tracking."""
     assert "vs SPY" in TAB_HEADERS[RETURNS_TRACKER]
+
+
+def test_suggestions_has_mandate_columns():
+    """The Suggestions tab is the operator's standing mandate; the approval
+    layer depends on these exact columns."""
+    h = TAB_HEADERS[SUGGESTIONS]
+    for required in ("Timestamp", "Ticker", "Action", "Max Allocation ($)", "Status"):
+        assert required in h, f"SUGGESTIONS missing column: {required}"

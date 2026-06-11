@@ -273,7 +273,7 @@ def test_bootstrap_creates_sheet_when_id_blank(fake_service, fake_store, config_
     assert sid.startswith("sheet_")
     assert url.startswith("https://docs.google.com/")
     assert "PortfolioMind Report" in fake_store.sheets[sid]["title"]
-    # All 11 tabs should be present.
+    # All 12 tabs should be present.
     sheet = fake_store.sheets[sid]
     for tab in TAB_NAMES:
         assert tab in sheet["tabs"], f"tab {tab!r} missing after bootstrap"
@@ -305,7 +305,7 @@ def test_bootstrap_idempotent_re_runs_no_duplicates(fake_service, fake_store, co
 
 
 def test_bootstrap_adds_missing_tabs_only(fake_service, fake_store, config_existing_sheet):
-    """If the sheet exists but only has 3 of the 11 tabs, bootstrap adds the other 8."""
+    """If the sheet exists but only has 3 of the 12 tabs, bootstrap adds the other 9."""
     sid = config_existing_sheet.google_sheet_id
     # Seed the fake store with a sheet that has 3 tabs.
     fake_store.sheets[sid] = {
@@ -321,12 +321,12 @@ def test_bootstrap_adds_missing_tabs_only(fake_service, fake_store, config_exist
     client = SheetsClient.from_config(config_existing_sheet)
     bootstrap_sheet(client, config_existing_sheet)
     sheet = fake_store.sheets[sid]
-    # All 11 tabs should now be present.
+    # All 12 tabs should now be present.
     for tab in TAB_NAMES:
         assert tab in sheet["tabs"], f"tab {tab!r} missing"
         assert sheet["tabs"][tab][0] == TAB_HEADERS[tab]
-    # Exactly 11 props.
-    assert len(sheet["props"]) == 11
+    # Exactly one prop per tab.
+    assert len(sheet["props"]) == len(TAB_NAMES)
 
 
 def test_bootstrap_unreachable_sheet_raises(fake_service, fake_store, config_existing_sheet):

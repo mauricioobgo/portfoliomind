@@ -395,16 +395,88 @@ Card 4 adds one optional env var:
   sentiment → single `Signal(ticker, combined, technical, sentiment,
   confidence, reasons)` in [-1, +1]. Card 7 (Discord approval) and
   card 8 (morning-run wiring) consume this.
-- Card 7: Position sizer + Discord interactive approval — in
-  progress. Will produce the `PositionSizer` and
-  `post_candidates_and_collect_reactions` functions the strategy
-  runner lazy-imports.
+- Card 7: Position sizer + approval — **done** (card 9 below). The
+  Discord flow was replaced with a Google-Sheets Suggestions
+  mandate; `PositionSizer` and
+  `post_candidates_and_collect_reactions` now exist and the
+  strategy runner picks them up automatically.
 - Card 8 (this card): Strategy runner wiring — done. The
   runner is the integration seam that will activate automatically
   once card 7 lands.
+- Card 9: Bullish patterns + probabilistic scoring + sizer +
+  suggestions approval + LLM agent layer — done. See below.
 - Real trading logic, scoring weights, R/R checks, KB-5
   disqualifications.
 - Paper-to-live account migration.
+
+## Card 9 — bullish patterns, probabilistic scoring, sizer, approval, agent
+
+Card 9 closes the card-6/7 gap the strategy runner was lazy-importing
+against. The morning strategy pipeline is now live end-to-end.
+
+### `portfoliomind.signals.patterns`
+
+Pure-math bullish pattern catalogue over daily closes: golden cross,
+uptrend stack, 55-day breakout, RSI oversold recovery, MACD bull
+cross, higher lows, pullback bounce. Each pattern carries a tunable
+`hit_rate` prior; detected patterns fold into a posterior
+`p_bullish` via shrunk log-odds (naive-Bayes with an
+`EVIDENCE_SHRINK=0.7` correlation discount), clamped to
+`[0.05, 0.95]`. **Never raises** — short history returns the
+`PRIOR_P_UP=0.53` base rate with a reason.
+
+### `portfoliomind.signals.combined`
+
+The `score_universe(top_n=...)` entry point the strategy runner
+imports. Per ticker: one injected `fetch` (default yfinance) →
+technical score + pattern posterior + LLM sentiment → blended score
+(0.40/0.35/0.25). Four gates: tech > 0, `p_bullish ≥ 0.55`,
+sentiment ≥ 0, blended ≥ 0.15. Returns sorted `Candidate`
+dataclasses (carrying `last_close`, `vol_20d`, `p_bullish` for the
+sizer). **Never raises.** Tests inject `fetch` and `sentiment_fn`.
+
+### `portfoliomind.signals.sizer`
+
+`PositionSizer().size(candidate) -> TradeOrder`. Quarter-Kelly on
+`p_bullish` at `REWARD_RISK=2.0`, hard `MAX_POSITION_FRACTION=0.10`
+cap, 3σ vol-anchored stop clamped to [2%, 8%], whole shares only.
+Equity from `PORTFOLIOMIND_EQUITY` (default $10k). Every order is
+re-validated through `OrderSpec.checked` (the SL/TP iron rules)
+before it leaves the sizer. Raises `SizingError` per-candidate (the
+runner logs + skips; the batch continues).
+
+### `portfoliomind.approval`
+
+The card-7 contract, implemented as a **Suggestions-mandate** flow
+instead of Discord: `post_candidates_and_collect_reactions` matches
+sized orders against the `💡 Suggestions` tab (12th tab, added in
+this card). Approve iff the ticker has an `ACTIVE`-status `BUY`-action
+row; quantities are scaled down to the row's `Max Allocation ($)`
+cap. `timeout_seconds` is accepted for contract compatibility but
+unused — the sheet IS the operator's standing reaction. Every
+decision is audited to `🗒️ Agent Log`. `persist_approved_trades`
+appends to `✅ Approved Trades`, dedup-keyed on
+`(Ticker, Timestamp)`. Tests inject fakes via
+`set_clients` / `reset_clients`.
+
+### `portfoliomind.agent`
+
+The LLM layer: `AGENT_SYSTEM_PROMPT` (rendered from the live sizer +
+gate constants by `build_system_prompt()` so prompt and code can't
+drift apart) and a 10-skill registry exposed as OpenAI
+function-calling tools (`to_openai_tools()` / `invoke_skill()`).
+Skills wire into the existing modules: Sheets connect, InvestingPro
+login, XTB login, read suggestions, scan patterns, analyze news,
+score universe, propose trades, execute approved trades, log action.
+Handlers **never raise** — the model always receives a structured
+`{"status": ...}` dict. `scripts/run_agent.py` runs the loop
+(dry-run by default; the two-toggle XTB gate still applies).
+
+### Strategy runner status
+
+`run_morning()` with no factories now exercises the REAL modules.
+The `not_implemented` path still exists for partial deployments and
+is tested by monkeypatching the `_try_import_*` helpers.
 
 ## Failure alerting (card 4)
 
